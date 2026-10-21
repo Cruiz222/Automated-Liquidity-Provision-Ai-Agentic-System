@@ -70,6 +70,15 @@ python3 -m app.paper_report data/paper-first/paper.sqlite3
 
 The report checks account balances against fills and fees, separates recorded outcomes from historical inferences, and summarizes feed faults and missed quote distances. See [audit limitations](PAPER_TRADING.md#execution-diagnostics-and-account-audit). These diagnostics do not automatically tune strategy parameters.
 
+## Frozen multi-capture evaluation
+
+```bash
+python3 -m app.evaluate freeze examples/evaluation_plan.json --output data/study.lock.json
+python3 -m app.evaluate run data/study.lock.json --output data/study-report.json
+```
+
+Freeze hashes datasets and effective scenario settings. Run verifies them, evaluates each segment with a separate account, and reports agent/baseline results by development, validation, or test role. See [study plans and interpretation](EVALUATION.md). The synthetic example demonstrates the workflow; scenarios remain illustrative execution assumptions.
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
