@@ -100,6 +100,14 @@ python3 -m app.experiments list
 
 Offline studies now have persistent IDs, run statuses, input/implementation fingerprints and hashed report artifacts. Matching completed studies can be reused after verification. The dashboard includes a read-only experiment list and details. See [registry operations and interruption handling](EXPERIMENTS.md).
 
+## End-to-end offline workflow
+
+```bash
+python3 -m app.pipeline data/paper-first/paper.sqlite3
+```
+
+The workflow reviews a completed capture, stops when more data is needed, or prepares qualifying development segments, freezes a study, generates a bounded offline proposal and registers its evaluation. Each phase is checkpointed in a fresh workspace. See [pipeline commands, outputs and exit codes](PIPELINE.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.

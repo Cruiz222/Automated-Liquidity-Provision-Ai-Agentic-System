@@ -39,3 +39,7 @@ These thresholds are explicit, configurable research policy. They are not statis
 For different criteria, use `--min-duration-seconds`, `--min-trades`, `--max-event-gap-ms`, `--max-alignment-lag-ms`, and `--min-healthy-fraction`. Their effective values are recorded in the report. Add `--require-qualified` for an automation-friendly exit status: 0 if a segment qualifies, 2 if more data is needed, and 1 on a review error. Without that option, a valid review exits successfully even when no segment qualifies.
 
 After collecting sufficient data, export separate continuity CSVs and use qualifying segments in a frozen evaluation plan. Keep development, validation and test periods separate. Simulated fill count is reported independently: passing data criteria does not provide real exchange fill observations or calibrate queue position. Captures already inspected during development are not untouched holdout data.
+
+## Continue after collection
+
+Use `python3 -m app.pipeline PATH_TO_COMPLETED_JOURNAL` to run the offline review-to-experiment workflow. It stops if the default data criteria are not met. See [pipeline documentation](PIPELINE.md) for phase checkpoints and separate development-only evaluation.

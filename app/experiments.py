@@ -114,7 +114,10 @@ def write_artifact(path, value):
 
 
 def run_study(manifest_path, registry_path=DEFAULT_REGISTRY, output_dir='data/experiments', repeat=False):
-    manifest = json.loads(Path(manifest_path).read_text())
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise ValueError(f'Frozen study not found: {manifest_path}. Create one with app.evaluate freeze PLAN.json --output {manifest_path}, or use an existing *.lock.json file.')
+    manifest = json.loads(manifest_path.read_text())
     code_hash = implementation_hash()
     fingerprint = digest({'manifest': manifest, 'implementation_sha256': code_hash, 'python_version': platform.python_version()})
     registry = Registry(registry_path)
