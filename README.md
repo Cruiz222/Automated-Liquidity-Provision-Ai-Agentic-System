@@ -40,10 +40,20 @@ python3 -m app.server --journal data/another-run.sqlite3
 
 Replay outputs the verified event count and reconstructed state as JSON. Journal files contain local research data and are excluded from Git.
 
+## Recorded market-data replay
+
+Run the offline evaluator against a validated single-instrument CSV:
+
+```bash
+python3 -m app.backtest examples/market_sample.csv --output data/sample-report.json
+```
+
+The supplied file is handcrafted synthetic data. Replace it with recorded data following the [CSV contract](MARKET_REPLAY.md). The runner models configurable latency, trade participation, queue ahead, partial fills, and fees. Its JSON report compares the inventory-aware agent with a zero-skew baseline and includes source provenance, decisions, fills, equity, drawdown, and inventory exposure. This offline model is separate from the dashboard simulation and its existing journal format. See [execution assumptions and report interpretation](MARKET_REPLAY.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
-2. Add recorded market-data replay and execution assumptions before evaluating strategies.
+2. Complete: CSV market-data replay, explicit execution assumptions, and baseline performance reports. Historical data acquisition and execution calibration remain open.
 3. Add exchange market-data adapters and a paper execution interface.
 4. Introduce an AI research agent with structured tools and bounded configuration proposals.
 5. Add account isolation, authentication, monitoring, and deployment infrastructure.
