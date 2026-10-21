@@ -18,7 +18,7 @@ python3 -m unittest discover -s tests -v
 
 The agent places a bid and, when inventory is available, an ask around a synthetic market price. Inventory shifts its quotes to reduce additional accumulation. Orders fill when the next synthetic price crosses their quote. Cash includes a configurable fee on every fill; equity marks inventory at the current market price. The account is long-only and cannot buy beyond its cash or inventory limits. The dashboard retains 200 price observations and 100 fills; a SQLite journal retains all simulation events on disk.
 
-This is a rule-based agent baseline. It does not yet use an AI model. A separate paper runner connects to public exchange market data with simulated orders. The simplified fill model does not model queue position, latency, partial fills, or actual market liquidity. Simulated P&L is not evidence of trading profitability.
+This is a rule-based agent baseline. The quoting strategy is rule-based; an optional research-only model adapter can propose offline stress studies. A separate paper runner connects to public exchange market data with simulated orders. The simplified fill model does not model queue position, latency, partial fills, or actual market liquidity. Simulated P&L is not evidence of trading profitability.
 
 ## Persistence and replay
 
@@ -87,12 +87,16 @@ python3 -m app.paper run --dns-mode doh --duration-seconds 1800
 
 Timed runs stop automatically and save `capture-review.json` beside their journal. The review checks each continuity segment against explicit duration, trade-count, event-spacing, feed-health and alignment criteria, with accounting verification. See [collection and review criteria](COLLECTION.md). Passing data checks does not establish strategy profitability or calibrate real exchange fills.
 
+## Research proposals
+
+The research proposer validates completed capture evidence and frozen datasets, then produces either a request for more data or a selection from fixed offline stress scenarios. An offline deterministic mode needs no credentials; an optional OpenAI adapter generates schema-constrained proposals. A separate materialize command creates a development-only study, preserving live settings and account limits. See [research workflow and API setup](RESEARCH_AGENT.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
 2. Complete: CSV market-data replay, explicit execution assumptions, and baseline performance reports. Historical data acquisition and execution calibration remain open.
 3. Complete: read-only OKX spot REST adapter, segmented capture exports, paper execution, and feed-health monitoring. Public connectivity has been verified with opt-in DoH in this environment; execution calibration remains open.
-4. Introduce an AI research agent with structured tools and bounded configuration proposals.
+4. Complete: bounded research proposals, deterministic offline mode, and an optional structured-output model adapter. Live model generation and evaluation of proposal quality remain open.
 5. Add account isolation, authentication, monitoring, and deployment infrastructure.
 
 Exchange trading requires a separate implementation and explicit operational configuration. This prototype has no credentials or live order route. Public market-data access depends on network reachability and exchange availability.
