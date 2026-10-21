@@ -60,6 +60,16 @@ python3 -m app.paper run --run-dir data/paper-first --polls 30
 
 Open http://127.0.0.1:8000. The separate OKX public REST runner captures BTC-USDT data, checks freshness and trade-window overlap, buffers book updates until the trade watermark reaches them, and simulates orders using the replay execution model. It records raw responses, decisions, fills, account state and feed faults in its own SQLite journal. The dashboard shows feed health and paper-account activity. No credentials are required. See [paper operation, capture exports, and feed limitations](PAPER_TRADING.md).
 
+## Execution diagnostics
+
+New paper runs record fill and non-fill outcomes and show their cumulative counts on the dashboard. Inspect a saved journal offline:
+
+```bash
+python3 -m app.paper_report data/paper-first/paper.sqlite3
+```
+
+The report checks account balances against fills and fees, separates recorded outcomes from historical inferences, and summarizes feed faults and missed quote distances. See [audit limitations](PAPER_TRADING.md#execution-diagnostics-and-account-audit). These diagnostics do not automatically tune strategy parameters.
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.

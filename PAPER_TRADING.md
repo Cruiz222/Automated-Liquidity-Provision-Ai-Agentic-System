@@ -95,3 +95,20 @@ Development checks found that both `www.okx.com` and `openapi.okx.com` failed DN
 The `trade-watermark-v1` alignment model was replayed against two completed 30-poll captures using their original receipt timestamps and configuration. Their original gap counts were 19 and 18; both became zero and ended healthy with watermark buffering. This validates the handling of those recorded timing patterns, not feed completeness or strategy profitability. Tests also cover delayed warm-up trades, monotonic execution timestamps, buffered snapshots, durable batch failure, genuine missing-anchor gaps, and stale polling.
 
 A fresh 30-poll DoH check accepted all 30 polls, ended healthy, and exported 1,154 processed rows in two replay-validated segments. It recorded one missing-anchor reset and no book/trade alignment resets. There were no fills, so this check validates capture and alignment rather than strategy performance. Local detailed evidence is saved in `data/alignment-validation.json` and the raw run journal in `data/paper-6d3d79ee38/paper.sqlite3`.
+
+## Execution diagnostics and account audit
+
+New paper batches record one execution outcome for each processed trade. The dashboard shows cumulative counts. Outcomes distinguish filled orders, prices that never reached the limit, quotes still awaiting latency, post-only rejections, no active quote on the relevant side, queue-ahead consumption, exhausted orders, account limits, negligible volume, and user pause. Book-only rows do not count as trade outcomes. These describe the local execution model, not exchange-verified fills.
+
+Audit a completed run without network access or changes to the journal:
+
+```bash
+python3 -m app.paper_report data/paper-6d3d79ee38/paper.sqlite3
+python3 -m app.paper_report data/paper-6d3d79ee38/paper.sqlite3 --output data/paper-audit-new.json
+```
+
+The report includes outcome counts, classification provenance, per-segment activity, processed-row spread statistics, distance of missed trades from active limits, final account state, P&L, drawdown, and feed fault occurrences. It records a digest of committed batch sequence numbers and payloads. Every processed account balance is reconciled against recorded fills, configured fees, and the row's midpoint; impossible balances, incorrect fees, or batch sequence gaps fail the audit. This is accounting consistency checking, not cryptographic authentication or a full execution replay. Output paths must be new.
+
+Older runs have no explicit outcome field. Their classifications are labelled `inferred_from_saved_state`; reachable but unfilled historical quotes remain `unfilled_reachable_quote` rather than assigning an unobserved queue or latency cause. Rows with no active quote cannot establish why it was absent. Gap-skipped and warm-up trades are outside the processed trade totals.
+
+The 30-poll alignment-validation run had 1,126 processed trades: 346 did not reach a saved active limit, and 780 had no active quote on the relevant side. It had no fills and its account reconciled. The configured half spread was 12 bps, while the processed-row mean full market spread was about 0.01188 bps; these figures describe different widths and do not establish profitable quoting settings. Execution settings remain unchanged pending longer data collection and calibration to observed fills.

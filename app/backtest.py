@@ -44,6 +44,8 @@ class ReplaySession:
         self.max_drawdown = self.max_drawdown_pct = self.max_inventory = 0.0
         self.rejected_orders = 0
         self.fill_count = 0
+        self.execution_counts = {}
+        self.last_execution = {'outcome': 'no_trade'}
         self.previous = None
 
     def cancel_orders(self):
@@ -61,6 +63,11 @@ class ReplaySession:
             self.inventory_time += self.account.inventory * elapsed
             self.inventory_notional_time += self.account.inventory * self.previous.mid * elapsed
         self.account.price = event.mid
+        rejected_sides = set()
+        self.last_execution = {'outcome': 'no_trade'}
+        if event.trade_side:
+            self.last_execution = {'outcome': 'paused' if not trade else 'no_active_quote',
+                                   'side': 'bid' if event.trade_side == 'sell' else 'ask'}
         # Replacements are atomic at arrival. Old orders remain live until then.
         if self.pending is not None and event.timestamp_ms >= self.pending['arrival_ms']:
             self.active = {}
@@ -68,12 +75,23 @@ class ReplaySession:
                 marketable = order['price'] >= event.ask if side == 'bid' else order['price'] <= event.bid
                 if marketable:
                     self.rejected_orders += 1
+                    rejected_sides.add(side)
                 else:
                     self.active[side] = dict(order)
             self.pending = None
         if trade and event.trade_side:
             side = 'bid' if event.trade_side == 'sell' else 'ask'
             order = self.active.get(side)
+            if order is None:
+                if side in rejected_sides:
+                    self.last_execution['outcome'] = 'post_only_rejected'
+                elif self.pending and side in self.pending['orders'] and self.pending['arrival_ms'] > event.timestamp_ms:
+                    self.last_execution['outcome'] = 'waiting_latency'
+            else:
+                reached = order['price'] >= event.trade_price if side == 'bid' else order['price'] <= event.trade_price
+                self.last_execution.update(outcome='price_not_reached' if not reached else 'order_exhausted',
+                                           limit_price=order['price'],
+                                           distance_bps=max(0, (event.trade_price - order['price'] if side == 'bid' else order['price'] - event.trade_price) / order['price'] * 10_000))
             if order and (order['price'] >= event.trade_price if side == 'bid' else order['price'] <= event.trade_price):
                 volume = event.trade_size * self.execution.participation
                 queue_consumed = min(order['queue'], volume)
@@ -85,7 +103,14 @@ class ReplaySession:
                 else:
                     capacity = self.account.inventory
                 size = max(0.0, min(order['remaining'], volume, capacity))
+                if order['remaining'] <= 1e-12:
+                    self.last_execution['outcome'] = 'order_exhausted'
+                elif volume <= 1e-12:
+                    self.last_execution['outcome'] = 'queue_ahead' if queue_consumed else 'negligible_volume'
+                elif capacity <= 1e-12:
+                    self.last_execution['outcome'] = 'account_limit'
                 if size > 1e-12:
+                    self.last_execution.update(outcome='filled', filled_size=size)
                     fee = order['price'] * size * self.config.fee_bps / 10_000
                     self.account.cash += (-order['price'] * size if side == 'bid' else order['price'] * size) - fee
                     self.account.inventory += size if side == 'bid' else -size
@@ -97,6 +122,9 @@ class ReplaySession:
                                   'submitted_event': order['submitted_event'],
                                   'side': 'buy' if side == 'bid' else 'sell',
                                   'price': order['price'], 'size': size, 'fee': fee})
+        if event.trade_side:
+            outcome = self.last_execution['outcome']
+            self.execution_counts[outcome] = self.execution_counts.get(outcome, 0) + 1
         equity = self.account.cash + self.account.inventory * event.mid
         self.peak = max(self.peak, equity)
         self.max_drawdown = max(self.max_drawdown, self.peak - equity)
@@ -143,6 +171,7 @@ class ReplaySession:
                 'post_only_rejections': self.rejected_orders,
                 'liquidation_value_at_final_bid_after_fee': self.account.cash + self.account.inventory * self.previous.bid * (1 - self.config.fee_bps / 10_000),
             },
+            'execution_diagnostics': dict(self.execution_counts),
             'fills': self.fills, 'decisions': self.decisions, 'equity_curve': self.curve,
         }
 

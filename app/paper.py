@@ -141,6 +141,7 @@ class PaperRunner:
             session.step(event, submit=self.running and submit, trade=self.running, decision_time_ms=received)
             records.append({
                 'segment': feed.segment, 'market': asdict(event),
+                'execution': dict(session.last_execution),
                 'decision': session.decisions[-1] if session.decisions and session.decisions[-1]['event'] == session.index else None,
                 'fills': [fill for fill in session.fills if fill['event'] == session.index],
                 'account': {'cash': session.account.cash, 'inventory': session.account.inventory,
@@ -227,6 +228,7 @@ class PaperRunner:
                     'history': [dict(tick=max(1, self.session.index + 2 - len(self.session.curve)) + i,
                                      price=row['mid'], equity=row['equity']) for i, row in enumerate(self.session.curve)],
                     'decisions': self.session.decisions[-10:],
+                    'execution_diagnostics': dict(self.session.execution_counts),
                     'metrics': self.session.report()['metrics'] if self.session.previous else {},
                     'pending_orders': copy.deepcopy(self.session.pending) if available else None}
 
