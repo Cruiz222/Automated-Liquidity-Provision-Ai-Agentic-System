@@ -74,12 +74,17 @@ def freeze(path):
     return dict(locked, manifest_sha256=digest(locked))
 
 
-def evaluate(manifest):
+def verify_inputs(manifest):
     locked = {key: value for key, value in manifest.items() if key != 'manifest_sha256'}
     if manifest['version'] != 1 or digest(locked) != manifest['manifest_sha256']:
         raise ValueError('Frozen manifest was changed or has an unsupported version')
     check_datasets(manifest['datasets'])
     # Verify all sources before computing any result, using the same bytes for parsing.
+    if not manifest['datasets'] or not manifest['scenarios']:
+        raise ValueError('Study needs datasets and scenarios')
+    for scenario in manifest['scenarios']:
+        Config(**scenario['config'])
+        Execution(**scenario['execution'])
     sources = []
     for dataset in manifest['datasets']:
         raw = Path(dataset['path']).read_bytes()
@@ -89,6 +94,11 @@ def evaluate(manifest):
         if len(events) != dataset['event_count'] or events[0].timestamp_ms != dataset['start_ms'] or events[-1].timestamp_ms != dataset['end_ms']:
             raise ValueError('Dataset metadata disagrees with frozen input')
         sources.append((dataset, events))
+    return sources
+
+
+def evaluate(manifest):
+    sources = verify_inputs(manifest)
     results = []
     for scenario in manifest['scenarios']:
         config = Config(**scenario['config'])

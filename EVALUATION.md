@@ -32,3 +32,7 @@ CSV evaluation uses event-time decisions. It therefore evaluates the recorded ma
 ## Completed local demonstration
 
 Two already-inspected, nonoverlapping segments from `data/paper-6d3d79ee38/validated-export` were frozen under separate development and validation labels, then evaluated with the paper defaults and a slower, lower-participation scenario with queue ahead and higher fees. All four agent evaluations had zero fills, so the experiment provides no basis to select execution settings or claim an advantage. The local report is `data/captured-study-report.json`, with frozen manifest `data/captured-study.lock.json`. These are local research artifacts excluded from Git.
+
+## Registering study attempts
+
+Use `python3 -m app.experiments run data/study.lock.json` to retain a persistent run ID, failure status, implementation fingerprint and report artifact hash. See [experiment registry](EXPERIMENTS.md) for verified reuse, explicit repeats and dashboard inspection. The original evaluate command remains available for standalone reports.

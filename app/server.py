@@ -2,14 +2,18 @@
 import argparse
 import json
 import logging
+import re
+import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 from urllib.parse import urlsplit
 from .storage import JournalError, PersistentEngine
+from .experiments import DEFAULT_REGISTRY, read_runs
 
 engine = None
 worker_error = None
+registry_path = DEFAULT_REGISTRY
 
 
 def state():
@@ -29,7 +33,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path == '/api/state':
+        if path == '/api/experiments' or path.startswith('/api/experiments/'):
+            identifier = path.removeprefix('/api/experiments/') if path != '/api/experiments' else None
+            if identifier is not None and not re.fullmatch(r'[0-9a-f]{32}', identifier):
+                self.respond(404, b'{"error":"Experiment not found"}')
+                return
+            try:
+                result = read_runs(registry_path, identifier)
+            except (OSError, sqlite3.Error, ValueError):
+                self.respond(503, b'{"error":"Experiment registry unavailable"}')
+                return
+            if identifier is not None and result is None:
+                self.respond(404, b'{"error":"Experiment not found"}')
+                return
+            self.respond(200, json.dumps(result).encode())
+        elif path == '/api/state':
             self.respond(200, json.dumps(state()).encode())
         elif path == '/':
             self.respond(200, Path(__file__).with_name('dashboard.html').read_bytes(), 'text/html; charset=utf-8')
@@ -54,10 +72,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global engine
+    global engine, registry_path
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--registry', type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument('--journal', default='data/simulation.sqlite3')
     args = parser.parse_args()
+    registry_path = args.registry
     engine = PersistentEngine(args.journal)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', 8000), Handler)

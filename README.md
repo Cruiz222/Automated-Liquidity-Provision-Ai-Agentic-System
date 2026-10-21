@@ -91,6 +91,15 @@ Timed runs stop automatically and save `capture-review.json` beside their journa
 
 The research proposer validates completed capture evidence and frozen datasets, then produces either a request for more data or a selection from fixed offline stress scenarios. An offline deterministic mode needs no credentials; an optional OpenAI adapter generates schema-constrained proposals. A separate materialize command creates a development-only study, preserving live settings and account limits. See [research workflow and API setup](RESEARCH_AGENT.md).
 
+## Registered experiments
+
+```bash
+python3 -m app.experiments run data/study.lock.json
+python3 -m app.experiments list
+```
+
+Offline studies now have persistent IDs, run statuses, input/implementation fingerprints and hashed report artifacts. Matching completed studies can be reused after verification. The dashboard includes a read-only experiment list and details. See [registry operations and interruption handling](EXPERIMENTS.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.

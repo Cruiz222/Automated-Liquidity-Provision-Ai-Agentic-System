@@ -289,6 +289,7 @@ def main():
     run.add_argument('--max-inventory', type=float, default=.01)
     run.add_argument('--port', type=int, default=8000)
     run.add_argument('--no-dashboard', action='store_true')
+    run.add_argument('--registry', type=Path, default=Path('data/experiments.sqlite3'))
     export = subparsers.add_parser('export', help='Export separate validated replay CSV segments')
     export.add_argument('journal', type=Path)
     export.add_argument('output_dir', type=Path)
@@ -320,6 +321,7 @@ def main():
             from http.server import ThreadingHTTPServer
             from . import server
             server.engine = runner
+            server.registry_path = args.registry
             http = ThreadingHTTPServer(('127.0.0.1', args.port), server.Handler)
             worker = threading.Thread(target=http.serve_forever, daemon=True)
             worker.start()
