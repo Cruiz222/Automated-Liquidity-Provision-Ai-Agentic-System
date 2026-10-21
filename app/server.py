@@ -14,7 +14,7 @@ worker_error = None
 
 def state():
     snapshot = engine.snapshot()
-    snapshot['storage_error'] = worker_error
+    snapshot['storage_error'] = worker_error or snapshot.get('storage_error')
     return snapshot
 
 
@@ -46,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             engine.set_running(self.path == '/api/resume')
-        except JournalError:
+        except (JournalError, RuntimeError):
             logging.exception('Could not persist agent control')
             self.respond(503, b'{"error":"Journal unavailable; control was not applied"}')
             return

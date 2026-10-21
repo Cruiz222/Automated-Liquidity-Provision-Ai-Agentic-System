@@ -1,6 +1,6 @@
 from dataclasses import replace
 import unittest
-from app.backtest import Execution, compare, run
+from app.backtest import Execution, ReplaySession, compare, run
 from app.engine import Config
 from app.market_data import MarketEvent
 
@@ -92,3 +92,16 @@ class BacktestTests(unittest.TestCase):
         result = run([event(0), event(0)], self.config, self.execution)
         self.assertIsNone(result['metrics']['time_weighted_inventory'])
         self.assertEqual(result['metrics']['quantity_fill_rate'], 0)
+
+
+class IncrementalSessionTests(unittest.TestCase):
+    def test_bounded_history_keeps_cumulative_metrics(self):
+        session = ReplaySession(Config(half_spread_bps=100, inventory_skew_bps=0),
+                                Execution(0, 1), history_limit=2)
+        session.step(event(0))
+        for i in range(1, 7):
+            session.step(event(i, 'sell' if i % 2 else 'buy', 1, 99 if i % 2 else 101))
+        self.assertEqual(len(session.fills), 2)
+        self.assertEqual(len(session.curve), 2)
+        self.assertEqual(session.report()['metrics']['fill_count'], 6)
+        self.assertEqual(session.report()['metrics']['filled_quantity'], 6)

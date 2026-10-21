@@ -18,7 +18,7 @@ python3 -m unittest discover -s tests -v
 
 The agent places a bid and, when inventory is available, an ask around a synthetic market price. Inventory shifts its quotes to reduce additional accumulation. Orders fill when the next synthetic price crosses their quote. Cash includes a configurable fee on every fill; equity marks inventory at the current market price. The account is long-only and cannot buy beyond its cash or inventory limits. The dashboard retains 200 price observations and 100 fills; a SQLite journal retains all simulation events on disk.
 
-This is a rule-based agent baseline. It does not yet use an AI model or connect to an exchange. The simplified fill model does not model queue position, latency, partial fills, or actual market liquidity. Simulated P&L is not evidence of trading profitability.
+This is a rule-based agent baseline. It does not yet use an AI model. A separate paper runner connects to public exchange market data with simulated orders. The simplified fill model does not model queue position, latency, partial fills, or actual market liquidity. Simulated P&L is not evidence of trading profitability.
 
 ## Persistence and replay
 
@@ -50,12 +50,22 @@ python3 -m app.backtest examples/market_sample.csv --output data/sample-report.j
 
 The supplied file is handcrafted synthetic data. Replace it with recorded data following the [CSV contract](MARKET_REPLAY.md). The runner models configurable latency, trade participation, queue ahead, partial fills, and fees. Its JSON report compares the inventory-aware agent with a zero-skew baseline and includes source provenance, decisions, fills, equity, drawdown, and inventory exposure. This offline model is separate from the dashboard simulation and its existing journal format. See [execution assumptions and report interpretation](MARKET_REPLAY.md).
 
+## Live public feed and paper trading
+
+Check connectivity first with `python3 -m app.network_check`. The default REST endpoint is `https://openapi.okx.com`; DNS failures must be resolved in the host network before capture can work.
+
+```bash
+python3 -m app.paper run --run-dir data/paper-first --polls 30
+```
+
+Open http://127.0.0.1:8000. The separate OKX public REST runner captures BTC-USDT data, checks freshness and trade-window overlap, and simulates orders using the replay execution model. It records raw responses, decisions, fills, account state and feed faults in its own SQLite journal. The dashboard shows feed health and paper-account activity. No credentials are required. See [paper operation, capture exports, and feed limitations](PAPER_TRADING.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
 2. Complete: CSV market-data replay, explicit execution assumptions, and baseline performance reports. Historical data acquisition and execution calibration remain open.
-3. Add exchange market-data adapters and a paper execution interface.
+3. Complete: read-only OKX spot REST adapter, segmented capture exports, paper execution, and feed-health monitoring. Live connectivity and execution calibration must be verified in the deployment environment.
 4. Introduce an AI research agent with structured tools and bounded configuration proposals.
 5. Add account isolation, authentication, monitoring, and deployment infrastructure.
 
-Exchange trading requires a separate implementation and explicit operational configuration. This prototype has no credentials or live order route.
+Exchange trading requires a separate implementation and explicit operational configuration. This prototype has no credentials or live order route. Public market-data access depends on network reachability and exchange availability.

@@ -26,102 +26,135 @@ class Execution:
             raise ValueError('queue_ahead must be finite and nonnegative')
 
 
-def run(events, config=None, execution=None):
-    """Input order breaks timestamp ties; current-row data cannot generate its own fill."""
-    if len(events) < 2:
-        raise ValueError('At least two market events are required')
-    if any(b.timestamp_ms < a.timestamp_ms for a, b in zip(events, events[1:])):
-        raise ValueError('Events must be chronological')
-    config, execution = config or Config(), execution or Execution()
-    account = Engine(config)
-    active, pending = {}, None
-    fills, decisions, curve = [], [], []
-    submitted_quantity = filled_quantity = fees = 0.0
-    inventory_notional_time = inventory_time = 0.0
-    peak = config.initial_cash
-    max_drawdown = max_drawdown_pct = max_inventory = 0.0
-    rejected_orders = 0
-    previous = None
-    for index, event in enumerate(events):
-        if previous is not None:
-            elapsed = event.timestamp_ms - previous.timestamp_ms
-            inventory_time += account.inventory * elapsed
-            inventory_notional_time += account.inventory * previous.mid * elapsed
-        account.price = event.mid
+class ReplaySession:
+    """Incremental execution model shared by CSV replay and live paper observation."""
+
+    def __init__(self, config=None, execution=None, history_limit=None):
+        self.config = config or Config()
+        self.execution = execution or Execution()
+        self.history_limit = history_limit
+        self.index = -1
+        self.first = None
+        self.account = Engine(self.config)
+        self.active, self.pending = {}, None
+        self.fills, self.decisions, self.curve = [], [], []
+        self.submitted_quantity = self.filled_quantity = self.fees = 0.0
+        self.inventory_notional_time = self.inventory_time = 0.0
+        self.peak = self.config.initial_cash
+        self.max_drawdown = self.max_drawdown_pct = self.max_inventory = 0.0
+        self.rejected_orders = 0
+        self.fill_count = 0
+        self.previous = None
+
+    def cancel_orders(self):
+        self.active = {}
+        self.pending = None
+
+    def step(self, event, submit=True, trade=True, decision_time_ms=None):
+        if self.previous is not None and event.timestamp_ms < self.previous.timestamp_ms:
+            raise ValueError('Events must be chronological')
+        if self.first is None:
+            self.first = event
+        self.index += 1
+        if self.previous is not None:
+            elapsed = event.timestamp_ms - self.previous.timestamp_ms
+            self.inventory_time += self.account.inventory * elapsed
+            self.inventory_notional_time += self.account.inventory * self.previous.mid * elapsed
+        self.account.price = event.mid
         # Replacements are atomic at arrival. Old orders remain live until then.
-        if pending is not None and event.timestamp_ms >= pending['arrival_ms']:
-            active = {}
-            for side, order in pending['orders'].items():
+        if self.pending is not None and event.timestamp_ms >= self.pending['arrival_ms']:
+            self.active = {}
+            for side, order in self.pending['orders'].items():
                 marketable = order['price'] >= event.ask if side == 'bid' else order['price'] <= event.bid
                 if marketable:
-                    rejected_orders += 1
+                    self.rejected_orders += 1
                 else:
-                    active[side] = dict(order)
-            pending = None
-        if event.trade_side:
+                    self.active[side] = dict(order)
+            self.pending = None
+        if trade and event.trade_side:
             side = 'bid' if event.trade_side == 'sell' else 'ask'
-            order = active.get(side)
+            order = self.active.get(side)
             if order and (order['price'] >= event.trade_price if side == 'bid' else order['price'] <= event.trade_price):
-                volume = event.trade_size * execution.participation
+                volume = event.trade_size * self.execution.participation
                 queue_consumed = min(order['queue'], volume)
                 order['queue'] -= queue_consumed
                 volume -= queue_consumed
                 if side == 'bid':
-                    capacity = min(config.max_inventory - account.inventory,
-                                   account.cash / (order['price'] * (1 + config.fee_bps / 10_000)))
+                    capacity = min(self.config.max_inventory - self.account.inventory,
+                                   self.account.cash / (order['price'] * (1 + self.config.fee_bps / 10_000)))
                 else:
-                    capacity = account.inventory
+                    capacity = self.account.inventory
                 size = max(0.0, min(order['remaining'], volume, capacity))
                 if size > 1e-12:
-                    fee = order['price'] * size * config.fee_bps / 10_000
-                    account.cash += (-order['price'] * size if side == 'bid' else order['price'] * size) - fee
-                    account.inventory += size if side == 'bid' else -size
+                    fee = order['price'] * size * self.config.fee_bps / 10_000
+                    self.account.cash += (-order['price'] * size if side == 'bid' else order['price'] * size) - fee
+                    self.account.inventory += size if side == 'bid' else -size
                     order['remaining'] -= size
-                    filled_quantity += size
-                    fees += fee
-                    fills.append({'event': index, 'timestamp_ms': event.timestamp_ms,
+                    self.filled_quantity += size
+                    self.fees += fee
+                    self.fill_count += 1
+                    self.fills.append({'event': self.index, 'timestamp_ms': event.timestamp_ms,
                                   'submitted_event': order['submitted_event'],
                                   'side': 'buy' if side == 'bid' else 'sell',
                                   'price': order['price'], 'size': size, 'fee': fee})
-        equity = account.cash + account.inventory * event.mid
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, peak - equity)
-        max_drawdown_pct = max(max_drawdown_pct, (peak - equity) / peak * 100)
-        max_inventory = max(max_inventory, account.inventory)
-        curve.append({'timestamp_ms': event.timestamp_ms, 'equity': equity,
-                      'cash': account.cash, 'inventory': account.inventory, 'mid': event.mid})
+        equity = self.account.cash + self.account.inventory * event.mid
+        self.peak = max(self.peak, equity)
+        self.max_drawdown = max(self.max_drawdown, self.peak - equity)
+        self.max_drawdown_pct = max(self.max_drawdown_pct, (self.peak - equity) / self.peak * 100)
+        self.max_inventory = max(self.max_inventory, self.account.inventory)
+        self.curve.append({'timestamp_ms': event.timestamp_ms, 'equity': equity,
+                      'cash': self.account.cash, 'inventory': self.account.inventory, 'mid': event.mid})
         # Keep a single in-flight replacement, rather than cancelling before arrival.
-        # No final-row submission: there is no remaining event that could execute it.
-        if pending is None and index < len(events) - 1:
-            quotes = account.quotes()
-            orders = {side: {'price': price, 'remaining': config.order_size,
-                             'queue': execution.queue_ahead, 'submitted_event': index}
+        if self.pending is None and submit:
+            quotes = self.account.quotes()
+            orders = {side: {'price': price, 'remaining': self.config.order_size,
+                             'queue': self.execution.queue_ahead, 'submitted_event': self.index}
                       for side, price in quotes.items() if price is not None}
-            submitted_quantity += sum(order['remaining'] for order in orders.values())
-            pending = {'arrival_ms': event.timestamp_ms + execution.latency_ms, 'orders': orders}
-            decisions.append({'event': index, 'timestamp_ms': event.timestamp_ms,
-                              'arrival_ms': pending['arrival_ms'], 'quotes': quotes})
-        previous = event
-    duration = events[-1].timestamp_ms - events[0].timestamp_ms
-    final = curve[-1]
-    return {
-        'metrics': {
-            'net_pnl': final['equity'] - config.initial_cash,
-            'return_pct': (final['equity'] / config.initial_cash - 1) * 100,
-            'final_equity': final['equity'], 'final_cash': account.cash,
-            'final_inventory': account.inventory, 'fees': fees,
-            'max_drawdown': max_drawdown, 'max_drawdown_pct': max_drawdown_pct,
-            'max_inventory': max_inventory,
-            'time_weighted_inventory': inventory_time / duration if duration else None,
-            'time_weighted_inventory_notional': inventory_notional_time / duration if duration else None,
-            'fill_count': len(fills), 'filled_quantity': filled_quantity,
-            'submitted_quantity': submitted_quantity,
-            'quantity_fill_rate': filled_quantity / submitted_quantity if submitted_quantity else 0,
-            'post_only_rejections': rejected_orders,
-            'liquidation_value_at_final_bid_after_fee': account.cash + account.inventory * events[-1].bid * (1 - config.fee_bps / 10_000),
-        },
-        'fills': fills, 'decisions': decisions, 'equity_curve': curve,
-    }
+            self.submitted_quantity += sum(order['remaining'] for order in orders.values())
+            decision_time = event.timestamp_ms if decision_time_ms is None else max(event.timestamp_ms, decision_time_ms)
+            self.pending = {'arrival_ms': decision_time + self.execution.latency_ms, 'orders': orders}
+            self.decisions.append({'event': self.index, 'timestamp_ms': event.timestamp_ms,
+                              'arrival_ms': self.pending['arrival_ms'], 'quotes': quotes})
+        self.previous = event
+
+        if self.history_limit is not None:
+            self.fills = self.fills[-self.history_limit:]
+            self.decisions = self.decisions[-self.history_limit:]
+            self.curve = self.curve[-self.history_limit:]
+
+    def report(self):
+        if self.previous is None:
+            raise ValueError('No market events processed')
+        duration = self.previous.timestamp_ms - self.first.timestamp_ms
+        final = self.curve[-1]
+        return {
+            'metrics': {
+                'net_pnl': final['equity'] - self.config.initial_cash,
+                'return_pct': (final['equity'] / self.config.initial_cash - 1) * 100,
+                'final_equity': final['equity'], 'final_cash': self.account.cash,
+                'final_inventory': self.account.inventory, 'fees': self.fees,
+                'max_drawdown': self.max_drawdown, 'max_drawdown_pct': self.max_drawdown_pct,
+                'max_inventory': self.max_inventory,
+                'time_weighted_inventory': self.inventory_time / duration if duration else None,
+                'time_weighted_inventory_notional': self.inventory_notional_time / duration if duration else None,
+                'fill_count': self.fill_count, 'filled_quantity': self.filled_quantity,
+                'submitted_quantity': self.submitted_quantity,
+                'quantity_fill_rate': self.filled_quantity / self.submitted_quantity if self.submitted_quantity else 0,
+                'post_only_rejections': self.rejected_orders,
+                'liquidation_value_at_final_bid_after_fee': self.account.cash + self.account.inventory * self.previous.bid * (1 - self.config.fee_bps / 10_000),
+            },
+            'fills': self.fills, 'decisions': self.decisions, 'equity_curve': self.curve,
+        }
+
+
+def run(events, config=None, execution=None):
+    """Input order breaks timestamp ties; current-row data cannot generate its own fill."""
+    if len(events) < 2:
+        raise ValueError('At least two market events are required')
+    session = ReplaySession(config, execution)
+    for index, event in enumerate(events):
+        session.step(event, submit=index < len(events) - 1)
+    return session.report()
 
 
 def compare(events, config=None, execution=None):
