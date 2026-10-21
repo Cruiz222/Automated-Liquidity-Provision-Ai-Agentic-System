@@ -20,15 +20,21 @@ class FeedError(ValueError):
 
 
 class OKXPublic:
-    def __init__(self, instrument='BTC-USDT', timeout=5, opener=urlopen, base_url=DEFAULT_BASE_URL):
+    def __init__(self, instrument='BTC-USDT', timeout=5, opener=None, base_url=DEFAULT_BASE_URL, dns_mode='system'):
         if not re.fullmatch(r'[A-Z0-9]+-USDT', instrument):
             raise ValueError('Use a USDT spot instrument such as BTC-USDT')
         if base_url not in BASE_URLS:
             raise ValueError('base_url must be an official supported OKX HTTPS endpoint')
+        if dns_mode not in ('system', 'doh'):
+            raise ValueError('dns_mode must be system or doh')
+        if opener is None and dns_mode == 'doh':
+            from .doh import DoHOpener
+            opener = DoHOpener(urlsplit(base_url).hostname)
+        self.dns_mode = dns_mode
         self.base_url = base_url
         self.instrument = instrument
         self.timeout = timeout
-        self.opener = opener
+        self.opener = opener or urlopen
 
     def _get(self, path, **params):
         request = Request(self.base_url + path + '?' + urlencode(params),

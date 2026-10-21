@@ -63,6 +63,56 @@ class PaperTests(unittest.TestCase):
         self.runner.ingest(payload(1800, [(2, 1400, 'sell', 99, 1), (3, 1700, 'sell', 99, .4)]))
         self.assertEqual(self.runner.snapshot()['inventory'], .4)
 
+    def test_books_ahead_of_trades_are_buffered_until_watermark_advances(self):
+        self.bootstrap()
+        self.now = 1200
+        first = (2, 1050, 'sell', 99, .2)
+        self.runner.ingest(payload(1200, [self.old, first]))
+        self.assertEqual(self.runner.session.previous.timestamp_ms, 1050)
+        self.assertEqual(self.runner.snapshot()['feed']['buffered_books'], 1)
+        self.now = 1400
+        second = (3, 1150, 'sell', 99, .3)
+        self.runner.ingest(payload(1400, [self.old, first, second]))
+        self.assertEqual(self.runner.session.previous.timestamp_ms, 1150)
+        self.assertEqual(self.runner.snapshot()['inventory'], .5)
+        self.assertEqual(self.runner.snapshot()['feed']['gaps'], 0)
+        self.now = 1600
+        third = (4, 1300, 'sell', 99, .1)
+        self.runner.ingest(payload(1600, [first, second, third]))
+        self.assertEqual(self.runner.snapshot()['feed']['gaps'], 0)
+        self.assertEqual(self.runner.session.previous.timestamp_ms, 1300)
+        batches = [json.loads(row[0]) for row in self.store.db.execute('SELECT payload FROM batches ORDER BY sequence')]
+        times = [e['market']['timestamp_ms'] for batch in batches for e in batch['events']]
+        self.assertEqual(times, [1000, 1050, 1150, 1200, 1300])
+
+    def test_delayed_pre_bootstrap_trades_are_skipped_without_resync(self):
+        self.bootstrap()
+        self.now = 1200
+        self.runner.ingest(payload(1200, [self.old, (2, 999, 'sell', 99, 1)]))
+        state = self.runner.snapshot()
+        self.assertEqual(state['feed']['warmup_skipped_trades'], 1)
+        self.assertEqual(state['feed']['gaps'], 0)
+        self.assertEqual(state['inventory'], 0)
+        self.assertEqual(self.runner.session.previous.timestamp_ms, 1000)
+
+    def test_empty_trade_window_does_not_advance_execution_clock(self):
+        self.bootstrap()
+        self.now = 1200
+        self.runner.ingest(payload(1200, [self.old]))
+        self.assertEqual(self.runner.session.previous.timestamp_ms, 1000)
+        self.assertEqual(self.runner.snapshot()['feed']['alignment_lag_ms'], 200)
+        self.assertEqual(self.runner.snapshot()['feed']['gaps'], 0)
+
+    def test_buffer_updates_are_not_published_if_storage_fails(self):
+        self.bootstrap()
+        before = self.runner.feed.books[:]
+        self.now = 1200
+        with patch.object(self.store, 'append', side_effect=sqlite3.OperationalError('disk full')):
+            with self.assertRaises(RuntimeError):
+                self.runner.ingest(payload(1200, [self.old, (2, 1100, 'sell', 99, .4)]))
+        self.assertEqual(self.runner.feed.books, before)
+        self.assertEqual(self.runner.snapshot()['inventory'], 0)
+
     def test_missing_overlap_cancels_and_starts_new_segment_without_catchup_fills(self):
         self.bootstrap()
         self.now = 1200
@@ -135,7 +185,7 @@ class PaperTests(unittest.TestCase):
         self.now = 1400
         self.runner.ingest(payload(1400, [(9, 1399, 'sell', 99, 1)]))
         counts = export_csv(self.root / 'run' / 'paper.sqlite3', self.root / 'export')
-        self.assertEqual(counts, {1: 3, 2: 1})
+        self.assertEqual(counts, {1: 2, 2: 1})
         events = load_csv(self.root / 'export' / 'market-0001.csv')
         self.assertEqual(events[1].trade_size, .4)
         batches = [json.loads(row[0]) for row in self.store.db.execute('SELECT payload FROM batches ORDER BY sequence')]

@@ -52,19 +52,19 @@ The supplied file is handcrafted synthetic data. Replace it with recorded data f
 
 ## Live public feed and paper trading
 
-Check connectivity first with `python3 -m app.network_check`. The default REST endpoint is `https://openapi.okx.com`; DNS failures must be resolved in the host network before capture can work.
+Check connectivity first with `python3 -m app.network_check`. The default REST endpoint is `https://openapi.okx.com`; If system DNS fails and you have no sudo access, use `python3 -m app.network_check --dns-mode doh` and add `--dns-mode doh` to the paper runner; this changes only the application transport.
 
 ```bash
 python3 -m app.paper run --run-dir data/paper-first --polls 30
 ```
 
-Open http://127.0.0.1:8000. The separate OKX public REST runner captures BTC-USDT data, checks freshness and trade-window overlap, and simulates orders using the replay execution model. It records raw responses, decisions, fills, account state and feed faults in its own SQLite journal. The dashboard shows feed health and paper-account activity. No credentials are required. See [paper operation, capture exports, and feed limitations](PAPER_TRADING.md).
+Open http://127.0.0.1:8000. The separate OKX public REST runner captures BTC-USDT data, checks freshness and trade-window overlap, buffers book updates until the trade watermark reaches them, and simulates orders using the replay execution model. It records raw responses, decisions, fills, account state and feed faults in its own SQLite journal. The dashboard shows feed health and paper-account activity. No credentials are required. See [paper operation, capture exports, and feed limitations](PAPER_TRADING.md).
 
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
 2. Complete: CSV market-data replay, explicit execution assumptions, and baseline performance reports. Historical data acquisition and execution calibration remain open.
-3. Complete: read-only OKX spot REST adapter, segmented capture exports, paper execution, and feed-health monitoring. Live connectivity and execution calibration must be verified in the deployment environment.
+3. Complete: read-only OKX spot REST adapter, segmented capture exports, paper execution, and feed-health monitoring. Public connectivity has been verified with opt-in DoH in this environment; execution calibration remains open.
 4. Introduce an AI research agent with structured tools and bounded configuration proposals.
 5. Add account isolation, authentication, monitoring, and deployment infrastructure.
 

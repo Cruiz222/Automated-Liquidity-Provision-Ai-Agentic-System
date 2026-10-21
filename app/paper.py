@@ -1,7 +1,7 @@
 """Read-only OKX feed capture and local paper execution."""
 import argparse
 import copy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
 from pathlib import Path
@@ -21,6 +21,9 @@ from .paper_store import PaperStore, export_csv
 @dataclass
 class FeedState:
     book: MarketEvent | None = None
+    books: list[MarketEvent] = field(default_factory=list)
+    segment_start_ms: int | None = None
+    warmup_skipped_trades: int = 0
     anchor: int | None = None
     received_ms: int | None = None
     status: str = 'waiting'
@@ -56,6 +59,7 @@ class PaperRunner:
         with self.lock:
             self.session.cancel_orders()
             self.feed.book = None
+            self.feed.books = []
             self.feed.anchor = None
             self.feed.status = 'disconnected'
             self.feed.error = str(error)
@@ -74,6 +78,9 @@ class PaperRunner:
         return {'status': status, 'error': self.feed.error, 'age_ms': age,
                 'gaps': self.feed.gaps, 'duplicates': self.feed.duplicates,
                 'skipped_trades': self.feed.skipped_trades, 'segment': self.feed.segment,
+                'warmup_skipped_trades': self.feed.warmup_skipped_trades,
+                'buffered_books': sum(self.session.previous is None or b.timestamp_ms > self.session.previous.timestamp_ms for b in self.feed.books),
+                'alignment_lag_ms': max(0, self.feed.book.timestamp_ms - self.session.previous.timestamp_ms) if self.feed.book and self.session.previous else None,
                 'instrument': self.instrument, 'transport': 'OKX public REST',
                 'continuity': 'overlap checked; completeness not guaranteed'}
 
@@ -95,6 +102,7 @@ class PaperRunner:
         if trades and trades[-1][1].timestamp_ms > received + 1000:
             raise FeedError('Trade timestamp is ahead of local clock')
         feed = copy.copy(self.feed)
+        feed.books = list(self.feed.books)
         session = copy.deepcopy(self.session, {id(self.session.account.lock): threading.RLock()})
         feed.duplicates += duplicates
         discontinuity = None
@@ -105,15 +113,25 @@ class PaperRunner:
         if feed.anchor is not None and feed.anchor not in {identifier for identifier, _ in trades}:
             discontinuity = 'Previous trade anchor is missing from the recent-trades window'
         new_trades = [(identifier, event) for identifier, event in trades
-                      if feed.anchor is not None and identifier > feed.anchor]
+                      if feed.anchor is None or identifier > feed.anchor]
         feed.duplicates += sum(identifier <= feed.anchor for identifier, _ in trades) if feed.anchor is not None else 0
         previous_time = session.previous.timestamp_ms if session.previous else -1
-        if new_trades and new_trades[0][1].timestamp_ms < previous_time:
-            discontinuity = 'Late trade would move the paper clock backwards'
-        for _, event in new_trades:
-            aligned_book = book if event.timestamp_ms >= book.timestamp_ms else feed.book
-            if aligned_book is None or not 0 <= event.timestamp_ms - aligned_book.timestamp_ms <= self.stale_ms:
-                discontinuity = 'No fresh earlier book is available for a new trade'
+        warmup_skipped = 0
+        if feed.book is not None:
+            if not feed.books or book.timestamp_ms > feed.books[-1].timestamp_ms:
+                feed.books.append(book)
+            eligible = []
+            for identifier, event in new_trades:
+                if feed.segment_start_ms is not None and event.timestamp_ms < feed.segment_start_ms:
+                    warmup_skipped += 1
+                    continue
+                if event.timestamp_ms < previous_time:
+                    discontinuity = 'Late trade would move the paper clock backwards'
+                candidates = [b for b in feed.books if b.timestamp_ms <= event.timestamp_ms]
+                if not candidates or event.timestamp_ms - candidates[-1].timestamp_ms > self.stale_ms:
+                    discontinuity = 'No fresh earlier book is available for a new trade'
+                eligible.append((identifier, event))
+            new_trades = eligible
         if discontinuity:
             session.cancel_orders()
             feed.gaps += 1
@@ -136,24 +154,34 @@ class PaperRunner:
                 raise FeedError('Cannot resynchronize before the last accepted event')
             session.cancel_orders()
             feed.segment += 1
+            feed.segment_start_ms = book.timestamp_ms
+            feed.books = [book]
             feed.skipped_trades += len(trades)
             process(book)
             feed.status = 'synchronizing'
         else:
-            inserted_book = False
-            for _, event in new_trades:
-                if not inserted_book and book.timestamp_ms <= event.timestamp_ms:
-                    if book.timestamp_ms > feed.book.timestamp_ms and book.timestamp_ms >= session.previous.timestamp_ms:
-                        process(book)
-                    inserted_book = True
-                aligned_book = book if inserted_book else feed.book
-                aligned = replace(aligned_book, timestamp_ms=event.timestamp_ms,
-                                  trade_price=event.trade_price, trade_size=event.trade_size,
-                                  trade_side=event.trade_side)
-                process(aligned)
-            if not inserted_book and book.timestamp_ms > feed.book.timestamp_ms and book.timestamp_ms >= session.previous.timestamp_ms:
-                process(book)
+            feed.warmup_skipped_trades += warmup_skipped
+            feed.skipped_trades += warmup_skipped
+            # The newest observed trade is the event-time watermark. Book
+            # snapshots ahead of it stay buffered, never advancing execution.
+            watermark = new_trades[-1][1].timestamp_ms if new_trades else previous_time
+            timeline = [(b.timestamp_ms, 0, 0, b) for b in feed.books
+                        if previous_time < b.timestamp_ms <= watermark]
+            timeline.extend((event.timestamp_ms, 1, identifier, event) for identifier, event in new_trades)
+            timeline.sort(key=lambda item: item[:3])
+            for _, kind, _, event in timeline:
+                if kind == 1:
+                    aligned_book = next(b for b in reversed(feed.books) if b.timestamp_ms <= event.timestamp_ms)
+                    event = replace(aligned_book, timestamp_ms=event.timestamp_ms,
+                                    trade_price=event.trade_price, trade_size=event.trade_size,
+                                    trade_side=event.trade_side)
+                process(event)
             feed.status = 'healthy'
+            # Retain one predecessor for alignment and a bounded window of
+            # newer snapshots. Lost older coverage still causes a real gap.
+            cutoff = max(session.previous.timestamp_ms, book.timestamp_ms - self.stale_ms)
+            predecessors = [b for b in feed.books if b.timestamp_ms <= cutoff]
+            feed.books = (predecessors[-1:] + [b for b in feed.books if b.timestamp_ms > cutoff])[-512:]
         feed.book = book
         feed.anchor = trades[-1][0] if trades else None
         feed.received_ms = received
@@ -176,6 +204,7 @@ class PaperRunner:
             # Resume starts from a fresh snapshot and ignores catch-up trades.
             if running:
                 self.feed.book = None
+                self.feed.books = []
                 self.feed.anchor = None
                 self.feed.status = 'synchronizing'
 
@@ -222,6 +251,7 @@ def main():
     run.add_argument('--run-dir', type=Path, default=Path('data') / ('paper-' + uuid.uuid4().hex[:10]))
     run.add_argument('--instrument', default='BTC-USDT')
     run.add_argument('--base-url', choices=BASE_URLS, default=DEFAULT_BASE_URL)
+    run.add_argument('--dns-mode', choices=('system', 'doh'), default='system')
     run.add_argument('--polls', type=int, default=0, help='0 means continuous; positive values bound the run')
     run.add_argument('--interval', type=float, default=1)
     run.add_argument('--stale-ms', type=int, default=5000)
@@ -242,13 +272,17 @@ def main():
         return
     if not .5 <= args.interval <= 60 or args.polls < 0 or args.stale_ms <= 0:
         parser.error('interval must be between 0.5 and 60 seconds, polls nonnegative, and stale-ms positive')
-    client = OKXPublic(args.instrument, base_url=args.base_url)
+    client = OKXPublic(args.instrument, base_url=args.base_url, dns_mode=args.dns_mode)
     config = Config(order_size=args.order_size, max_inventory=args.max_inventory, fee_bps=args.fee_bps)
     execution = Execution(args.latency_ms, args.participation, args.queue_ahead)
-    store = PaperStore(args.run_dir, {'version': 1, 'instrument': args.instrument,
-                                    'config': asdict(config), 'execution': asdict(execution),
-                                    'stale_ms': args.stale_ms, 'source': 'OKX public REST', 'base_url': args.base_url,
-                                    'model': 'passive-trade-replay-v1; held prior REST book approximation'})
+    try:
+        store = PaperStore(args.run_dir, {'version': 1, 'instrument': args.instrument,
+                                        'config': asdict(config), 'execution': asdict(execution),
+                                        'stale_ms': args.stale_ms, 'source': 'OKX public REST', 'base_url': args.base_url, 'dns_mode': args.dns_mode,
+                                        'model': 'passive-trade-replay-v1; held prior REST book approximation',
+                                    'alignment_model': 'trade-watermark-v1'})
+    except FileExistsError:
+        parser.error(f'Run directory already exists: {args.run_dir}. Omit --run-dir to generate a fresh directory, or choose a new path.')
     runner = PaperRunner(store, args.instrument, config, execution, args.stale_ms)
     http = worker = None
     successful_polls = 0
