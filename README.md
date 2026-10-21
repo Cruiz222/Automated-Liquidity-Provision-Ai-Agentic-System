@@ -125,3 +125,5 @@ An optional WebSocket transport now processes public book and trade updates thro
 5. Add account isolation, authentication, monitoring, and deployment infrastructure.
 
 Exchange trading requires a separate implementation and explicit operational configuration. This prototype has no credentials or live order route. Public market-data access depends on network reachability and exchange availability.
+
+Offline quote-width sensitivity is available with `python3 -m app.quote_study data/workflow-b6568a5d02/study.lock.json` when that local workflow exists. See [QUOTE_STUDY.md](QUOTE_STUDY.md) for development-only input rules, recorded results, and execution limitations.

@@ -132,7 +132,7 @@ def evaluate(manifest):
             'results': results, 'summaries': summaries,
             'assumptions': [
                 'Every dataset starts with a separate account and no inventory; no fills or capital cross segment boundaries.',
-                'Sensitivity scenarios change only specified execution assumptions and fees, never select or deploy a winner.',
+                'Scenarios use their explicitly frozen configurations and execution assumptions; results never select or deploy a winner.',
                 'Per-role means weight independent segments equally; they are not portfolio returns or compounded P&L.',
                 'All datasets must describe the declared single instrument using a consistent epoch timestamp base.',
                 'CSV replay uses event-time decisions; it does not reproduce live poll receipt times or user controls.',
