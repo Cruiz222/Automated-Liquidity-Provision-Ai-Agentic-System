@@ -65,7 +65,7 @@ def verify_capture(capture, manifest, journal_path=None):
     current = review(journal, Criteria(**capture['criteria']))
     keys = ('criteria', 'instrument', 'segments', 'qualified_segments', 'accounting_verified')
     if any(current[key] != capture[key] for key in keys) or current['source']['committed_batches_sha256'] != capture['source']['committed_batches_sha256']:
-        raise ValueError('Capture evidence is modified or no longer matches its journal')
+        raise ValueError('Capture review does not match the current journal or review model; regenerate it with app.capture_review before proposing a study')
     if capture['instrument'] != manifest['instrument']:
         raise ValueError('Capture and study instruments disagree')
     qualified = set(capture['qualified_segments'])

@@ -43,3 +43,5 @@ After collecting sufficient data, export separate continuity CSVs and use qualif
 ## Continue after collection
 
 Use `python3 -m app.pipeline PATH_TO_COMPLETED_JOURNAL` to run the offline review-to-experiment workflow. It stops if the default data criteria are not met. See [pipeline documentation](PIPELINE.md) for phase checkpoints and separate development-only evaluation.
+
+The current review model is `segment-alignment-v2`: WebSocket bootstrap polls without a processed snapshot are not compared with an old segment clock. They remain in health statistics and are counted explicitly in `bootstrap_alignment_polls_excluded`. Active-segment alignment and all numeric criteria are unchanged. See [snapshot resynchronization evidence](WEBSOCKET_FEED.md#snapshot-resynchronization-and-segment-alignment-review-v2).

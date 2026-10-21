@@ -114,7 +114,7 @@ The dashboard now combines current feed health with saved capture reviews, workf
 
 ## Streaming market data
 
-An optional WebSocket transport now processes public book and trade updates through a bounded reorder buffer, removing the REST model's dependence on a new trade to advance book events. It uses the same journal and offline tools, with reconnect cancellation and unchanged quality limits. See [setup, live command and timing evidence](WEBSOCKET_FEED.md).
+An optional WebSocket transport now processes public book and trade updates through a bounded reorder buffer, removing the REST model's dependence on a new trade to advance book events. It uses the same journal and offline tools, with reconnect cancellation, local snapshot resynchronization and unchanged numeric quality limits. Capture review measures alignment only when a processed snapshot establishes the segment clock. See [setup, live command and timing evidence](WEBSOCKET_FEED.md).
 
 ## Next implementation stages
 

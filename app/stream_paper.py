@@ -16,6 +16,9 @@ class StreamState(FeedState):
     processed_book: MarketEvent | None = None
     last_book_sequence: int | None = None
     recent_ids: list = field(default_factory=list)
+    resync_after_ms: int | None = None
+    snapshot_resyncs: int = 0
+    last_snapshot_resync_reason: str | None = None
 
 
 class StreamPaperRunner(PaperRunner):
@@ -30,8 +33,13 @@ class StreamPaperRunner(PaperRunner):
         result = super().health()
         result.update(transport='OKX public WebSocket', connection_epoch=self.feed.epoch,
                       buffered_events=len(self.feed.buffer), reorder_ms=self.reorder_ms,
+                      awaiting_snapshot=self.feed.processed_book is None,
+                      snapshot_resyncs=self.feed.snapshot_resyncs,
+                      last_snapshot_resync_reason=self.feed.last_snapshot_resync_reason,
                       buffered_books=sum(e['kind'] == 'book' for e in self.feed.buffer),
                       continuity='single-connection snapshots; no complete exchange sequence guarantee')
+        if self.feed.processed_book is None:
+            result['alignment_lag_ms'] = None
         return result
 
     def fail(self, error, raw=None):
@@ -41,6 +49,7 @@ class StreamPaperRunner(PaperRunner):
             self.feed.epoch = None
             self.feed.last_book_sequence = None
             self.feed.recent_ids = []
+            self.feed.resync_after_ms = None
             super().fail(error, raw)
 
     def set_running(self, running):
@@ -72,7 +81,8 @@ class StreamPaperRunner(PaperRunner):
             if feed.epoch is not None:
                 feed.gaps += 1
             feed = StreamState(segment=feed.segment, gaps=feed.gaps, duplicates=feed.duplicates,
-                               skipped_trades=feed.skipped_trades, epoch=raw['epoch'], startup_ms=received)
+                               skipped_trades=feed.skipped_trades, epoch=raw['epoch'], startup_ms=received,
+                               snapshot_resyncs=feed.snapshot_resyncs, last_snapshot_resync_reason=feed.last_snapshot_resync_reason)
             session.cancel_orders()
         if feed.received_ms is not None and received - feed.received_ms > self.stale_ms:
             raise FeedError('WebSocket ingestion stalled beyond freshness limit')
@@ -135,23 +145,42 @@ class StreamPaperRunner(PaperRunner):
         ready = sorted((e for e in feed.buffer if e['source_ms'] <= cutoff),
                        key=lambda e: (e['source_ms'], 0 if e['kind'] == 'book' else 1, e['id']))
         feed.buffer = [e for e in feed.buffer if e['source_ms'] > cutoff]
-        records = []
+        records, skipped, resynchronizations = [], [], []
+
+        def require_snapshot(source_ms, reason):
+            session.cancel_orders()
+            feed.processed_book = None
+            feed.resync_after_ms = source_ms
+            feed.snapshot_resyncs += 1
+            feed.gaps += 1
+            feed.last_snapshot_resync_reason = reason
+            resynchronizations.append({'source_ms': source_ms, 'reason': reason})
+
         for item in ready:
             if item['kind'] == 'trade' and (feed.processed_book is None or item['source_ms'] < feed.segment_start_ms):
                 feed.skipped_trades += 1
+                skipped.append({'trade_id': item['id'], 'source_ms': item['source_ms'], 'reason': 'awaiting_fresh_snapshot'})
+                continue
+            if item['kind'] == 'book' and feed.processed_book is None and feed.resync_after_ms is not None and item['source_ms'] < feed.resync_after_ms:
                 continue
             if session.previous is not None and item['source_ms'] < session.previous.timestamp_ms:
                 raise FeedError('Event arrived after the reorder deadline')
             if item['kind'] == 'book':
                 event = MarketEvent(**item['market'])
+                if feed.processed_book is not None and event.timestamp_ms - feed.processed_book.timestamp_ms > self.stale_ms:
+                    require_snapshot(event.timestamp_ms, 'Book updates resumed after a source freshness gap')
                 if feed.processed_book is None:
                     feed.segment += 1
                     feed.segment_start_ms = event.timestamp_ms
+                    feed.resync_after_ms = None
                     session.cancel_orders()
                 feed.processed_book = event
             else:
                 if item['source_ms'] - feed.processed_book.timestamp_ms > self.stale_ms:
-                    raise FeedError('Trade has no fresh earlier book')
+                    require_snapshot(item['source_ms'], 'Trade has no fresh earlier book')
+                    feed.skipped_trades += 1
+                    skipped.append({'trade_id': item['id'], 'source_ms': item['source_ms'], 'reason': 'no_fresh_earlier_book'})
+                    continue
                 event = replace(feed.processed_book, timestamp_ms=item['source_ms'],
                                 trade_price=item['trade_price'], trade_size=item['trade_size'], trade_side=item['trade_side'])
             session.step(event, submit=self.running, trade=self.running, decision_time_ms=received)
@@ -161,12 +190,30 @@ class StreamPaperRunner(PaperRunner):
                 'account': {'cash': session.account.cash, 'inventory': session.account.inventory,
                             'equity': session.curve[-1]['equity'], 'fees': session.fees},
                 'active_orders': copy.deepcopy(session.active), 'pending_orders': copy.deepcopy(session.pending), 'running': self.running})
+        # Cancel as soon as received-but-buffered data proves the previous
+        # snapshot can no longer support execution. Do not use a future book
+        # to manufacture a fill for the preceding stale trade.
+        probe = feed.processed_book
+        if probe is not None:
+            for item in sorted(feed.buffer, key=lambda e: (e['source_ms'], 0 if e['kind'] == 'book' else 1, e['id'])):
+                if item['kind'] == 'book':
+                    if item['source_ms'] - probe.timestamp_ms > self.stale_ms:
+                        require_snapshot(item['source_ms'], 'Book updates resumed after a source freshness gap')
+                        break
+                    probe = MarketEvent(**item['market'])
+                elif item['source_ms'] - probe.timestamp_ms > self.stale_ms:
+                    require_snapshot(item['source_ms'], 'Trade has no fresh earlier book')
+                    feed.skipped_trades += 1
+                    skipped.append({'trade_id': item['id'], 'source_ms': item['source_ms'], 'reason': 'no_fresh_earlier_book'})
+                    feed.buffer.remove(item)
+                    break
         feed.status = 'healthy' if feed.processed_book is not None else 'synchronizing'
         feed.received_ms, feed.error = received, None
         saved_health = asdict(feed)
         saved_health.pop('buffer', None)
         saved_health.pop('recent_ids', None)
         saved_health['buffered_events'] = len(feed.buffer)
-        self._append({'received_ms': received, 'raw': raw, 'events': records, 'health': saved_health, 'control': None})
+        self._append({'received_ms': received, 'raw': raw, 'events': records, 'health': saved_health, 'control': None,
+                      'skipped_events': skipped, 'snapshot_resynchronizations': resynchronizations})
         self.feed, self.session = feed, session
         return True

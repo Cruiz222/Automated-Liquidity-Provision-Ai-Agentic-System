@@ -47,7 +47,7 @@ def review(path, criteria=None):
                 stats = segments.setdefault(current_segment, {'segment': current_segment, 'events': 0, 'trades': 0,
                     'start_ms': event.timestamp_ms, 'end_ms': event.timestamp_ms,
                     'max_event_gap_ms': 0, 'polls': 0, 'healthy_polls': 0, 'max_alignment_lag_ms': 0,
-                    'alignment_observed': False, 'starts_with_book': event.trade_side is None})
+                    'alignment_observed': False, 'bootstrap_alignment_polls_excluded': 0, 'starts_with_book': event.trade_side is None})
                 if event.timestamp_ms < stats['end_ms']:
                     raise ValueError('Segment event timestamps regressed')
                 stats['max_event_gap_ms'] = max(stats['max_event_gap_ms'], event.timestamp_ms - stats['end_ms'])
@@ -63,7 +63,9 @@ def review(path, criteria=None):
                     stats['polls'] += 1
                     stats['healthy_polls'] += int(healthy)
                     health = batch['health']
-                    if health.get('book'):
+                    if health.get('book') and 'processed_book' in health and health['processed_book'] is None:
+                        stats['bootstrap_alignment_polls_excluded'] += 1
+                    elif health.get('book'):
                         lag = max(0, health['book']['timestamp_ms'] - stats['end_ms'])
                         stats['max_alignment_lag_ms'] = max(stats['max_alignment_lag_ms'], lag)
                         stats['alignment_observed'] = True
@@ -88,7 +90,7 @@ def review(path, criteria=None):
         stats['qualified'] = all(checks.values())
         if stats['qualified']:
             qualified.append(segment)
-    return {'report_version': 1, 'criteria': asdict(criteria), 'source': accounting['source'],
+    return {'report_version': 1, 'review_model': 'segment-alignment-v2', 'criteria': asdict(criteria), 'source': accounting['source'],
             'instrument': accounting['instrument'], 'polls': polls, 'healthy_polls': healthy_polls,
             'segments': list(segments.values()), 'qualified_segments': qualified,
             'status': 'qualified_segments_available' if qualified else 'more_data_needed',
@@ -96,6 +98,7 @@ def review(path, criteria=None):
             'simulated_fill_count': accounting['fill_count'], 'final_account': accounting['final_account'],
             'notes': ['Criteria are configurable research-data policy, not statistically calibrated thresholds.',
                       'Segments remain separate; qualifying one does not certify the whole run.',
+                      'WebSocket alignment is undefined before a processed snapshot; bootstrap polls count toward health but are not compared with an older segment clock.',
                       'Event spacing and overlap checks cannot establish feed completeness.',
                       'Simulated fills do not calibrate real exchange queue position or establish profitability.',
                       'Already inspected captures are not untouched holdout data.']}

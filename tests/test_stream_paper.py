@@ -118,6 +118,55 @@ class StreamPaperTests(unittest.TestCase):
         self.assertEqual(self.runner.session.account.inventory, 0)
         self.assertEqual(self.runner.feed.recent_ids, [])
 
+    def test_stale_trade_before_fresh_buffered_book_cancels_without_future_fill(self):
+        self.bootstrap()
+        self.now = 3000
+        self.ingest([])
+        self.now = 5000
+        self.ingest([])
+        self.now = 5950
+        self.assertTrue(self.ingest([trade(5910, 1), book(5930, 2)]))
+        self.assertIsNone(self.runner.feed.processed_book)
+        self.assertIsNone(self.runner.health()['alignment_lag_ms'])
+        self.assertEqual(self.runner.feed.snapshot_resyncs, 1)
+        self.assertEqual(self.runner.session.active, {})
+        self.assertIsNone(self.runner.session.pending)
+        self.assertEqual(self.runner.session.account.inventory, 0)
+        self.now = 6100
+        self.assertTrue(self.ingest([]))
+        self.assertEqual(self.runner.feed.segment, 2)
+        self.assertEqual(self.runner.feed.epoch, 1)
+        self.assertEqual(self.runner.session.account.inventory, 0)
+        batches = [json.loads(row[0]) for row in self.store.db.execute('SELECT payload FROM batches')]
+        dropped = [item for batch in batches for item in batch.get('skipped_events', [])]
+        self.assertEqual(dropped[0]['reason'], 'no_fresh_earlier_book')
+        self.assertTrue(audit(self.journal)['accounting_verified'])
+
+    def test_book_resuming_after_silence_starts_segment_and_cancels_stale_orders(self):
+        self.bootstrap()
+        self.now = 3000
+        self.ingest([])
+        self.now = 5000
+        self.ingest([])
+        self.now = 6200
+        self.assertTrue(self.ingest([book(6100, 2)]))
+        self.assertEqual(self.runner.feed.segment, 2)
+        self.assertEqual(self.runner.feed.snapshot_resyncs, 1)
+        self.assertEqual(self.runner.session.account.inventory, 0)
+        self.assertEqual(self.runner.session.active, {})
+
+    def test_genuine_book_staleness_still_fails_at_unchanged_limit(self):
+        self.bootstrap()
+        self.now = 3000
+        self.ingest([])
+        self.now = 5000
+        self.ingest([])
+        self.now = 6100
+        self.assertFalse(self.ingest([]))
+        self.assertIn('book freshness limit exceeded', self.runner.feed.error)
+        self.assertEqual(self.runner.session.active, {})
+        self.assertIsNone(self.runner.session.pending)
+
     def test_export_and_audit_use_same_existing_schema(self):
         self.bootstrap()
         self.now = 1300

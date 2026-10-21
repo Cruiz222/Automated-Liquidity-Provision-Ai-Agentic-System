@@ -327,7 +327,7 @@ def main():
                                         'config': asdict(config), 'execution': asdict(execution),
                                         'stale_ms': args.stale_ms, 'source': 'OKX public WebSocket' if args.transport == 'websocket' else 'OKX public REST', 'transport': args.transport, 'reorder_ms': args.reorder_ms if args.transport == 'websocket' else None, 'base_url': args.base_url, 'dns_mode': args.dns_mode,
                                         'model': 'passive-trade-replay-v1; held prior REST book approximation',
-                                    'alignment_model': 'bounded-reorder-v1' if args.transport == 'websocket' else 'trade-watermark-v1',
+                                    'alignment_model': 'bounded-reorder-snapshot-resync-v2' if args.transport == 'websocket' else 'trade-watermark-v1',
                                         'collection': {'polls': args.polls, 'duration_seconds': args.duration_seconds, 'interval_seconds': args.interval}})
     except FileExistsError:
         parser.error(f'Run directory already exists: {args.run_dir}. Omit --run-dir to generate a fresh directory, or choose a new path.')

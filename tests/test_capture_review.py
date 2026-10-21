@@ -59,6 +59,27 @@ class CaptureReviewTests(unittest.TestCase):
         self.assertAlmostEqual(report['segments'][0]['healthy_poll_fraction'], 1/3)
         self.assertIn('feed_health', report['segments'][0]['failed_checks'])
 
+    def test_reconnect_bootstrap_does_not_compare_with_previous_segment_clock(self):
+        self.populate()
+        self.store.append({'received_ms': 12000, 'raw': {'transport': 'websocket'}, 'events': [],
+                           'health': {'status': 'synchronizing', 'book': {'timestamp_ms': 11900}, 'processed_book': None},
+                           'control': None})
+        report = review(self.path, Criteria(min_duration_ms=0, min_trades=1, min_healthy_poll_fraction=0))
+        stats = report['segments'][0]
+        self.assertEqual(stats['max_alignment_lag_ms'], 100)
+        self.assertEqual(stats['bootstrap_alignment_polls_excluded'], 1)
+        self.assertEqual(report['qualified_segments'], ['1'])
+        self.assertEqual(report['review_model'], 'segment-alignment-v2')
+
+    def test_active_segment_alignment_is_still_measured_at_original_limit(self):
+        self.populate()
+        self.store.append({'received_ms': 12000, 'raw': {'transport': 'websocket'}, 'events': [],
+                           'health': {'status': 'healthy', 'book': {'timestamp_ms': 11900},
+                                      'processed_book': {'timestamp_ms': 1900}}, 'control': None})
+        report = review(self.path, Criteria(min_duration_ms=0, min_trades=1, min_healthy_poll_fraction=0))
+        self.assertEqual(report['segments'][0]['max_alignment_lag_ms'], 10000)
+        self.assertIn('alignment_lag', report['segments'][0]['failed_checks'])
+
     def test_qualification_exit_codes(self):
         self.populate()
         command = [sys.executable, '-m', 'app.capture_review', str(self.path), '--require-qualified']
