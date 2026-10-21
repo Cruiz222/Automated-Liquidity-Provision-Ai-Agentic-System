@@ -9,7 +9,13 @@ import time
 from .experiments import DEFAULT_REGISTRY, read_runs
 
 
-COLLECT_COMMAND = ['python3', '-m', 'app.paper', 'run', '--dns-mode', 'doh', '--duration-seconds', '1800']
+def collection_command():
+    project = Path(__file__).resolve().parents[1]
+    executable = project / '.venv' / 'bin' / 'python'
+    installed = list((project / '.venv' / 'lib').glob('python*/site-packages/websockets-17.2.dist-info'))
+    if executable.is_file() and installed:
+        return [str(executable), '-m', 'app.paper', 'run', '--transport', 'websocket', '--dns-mode', 'doh', '--duration-seconds', '1800']
+    return ['python3', '-m', 'app.paper', 'run', '--dns-mode', 'doh', '--duration-seconds', '1800']
 
 
 def snapshot(data_dir='data', registry_path=DEFAULT_REGISTRY, active=None, clock=time.time):
@@ -63,7 +69,7 @@ def snapshot(data_dir='data', registry_path=DEFAULT_REGISTRY, active=None, clock
     latest_capture = captures[0] if captures else None
     latest_workflow = workflows[0] if workflows else None
     action = {'code': 'collect_data', 'label': 'Collect a longer independent market-data capture.',
-              'command': shlex.join(COLLECT_COMMAND), 'artifact_path': None}
+              'command': shlex.join(collection_command()), 'artifact_path': None}
     active_summary = None
     if active:
         active_summary = {key: active.get(key) for key in ('mode', 'instrument', 'running', 'feed', 'storage_error')}

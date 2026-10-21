@@ -84,6 +84,12 @@ class PipelineTests(unittest.TestCase):
                 run_pipeline(self.journal, self.workspace, self.registry, self.criteria)
         self.assertFalse(self.registry.exists())
 
+    def test_missing_journal_fails_before_creating_workspace(self):
+        with self.assertRaisesRegex(ValueError, 'Capture journal not found'):
+            run_pipeline(self.root / 'missing.sqlite3', self.workspace, self.registry)
+        self.assertFalse(self.workspace.exists())
+        self.assertFalse(self.registry.exists())
+
     def test_cli_more_data_exit_status_and_no_network(self):
         command = [sys.executable, '-m', 'app.pipeline', str(self.journal), '--output-dir', str(self.workspace), '--registry', str(self.registry)]
         result = subprocess.run(command, capture_output=True, text=True)

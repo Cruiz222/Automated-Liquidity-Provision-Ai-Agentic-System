@@ -112,6 +112,10 @@ The workflow reviews a completed capture, stops when more data is needed, or pre
 
 The dashboard now combines current feed health with saved capture reviews, workflow checkpoints and experiment attempts. Its read-only Operations panel suggests a concrete next action without starting work automatically. The same saved-artifact summary is available with `python3 -m app.operations`. See [discovery, freshness and next-action rules](OPERATIONS.md).
 
+## Streaming market data
+
+An optional WebSocket transport now processes public book and trade updates through a bounded reorder buffer, removing the REST model's dependence on a new trade to advance book events. It uses the same journal and offline tools, with reconnect cancellation and unchanged quality limits. See [setup, live command and timing evidence](WEBSOCKET_FEED.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.

@@ -7,6 +7,8 @@ import logging
 import math
 from pathlib import Path
 import sqlite3
+import shlex
+import sys
 import threading
 import time
 from urllib.error import URLError
@@ -241,7 +243,10 @@ class PaperRunner:
 
 def poll_once(runner, client):
     try:
-        return runner.ingest(client.poll())
+        accepted = runner.ingest(client.poll())
+        if not accepted and hasattr(client, 'close'):
+            client.close()
+        return accepted
     except (FeedError, URLError, OSError, ValueError, KeyError, TypeError) as error:
         runner.fail(error)
         return False
@@ -261,7 +266,7 @@ def collect(runner, client, polls=0, duration_seconds=None, interval=1,
         emit(json.dumps({'poll': count, 'accepted': accepted, 'feed': runner.snapshot()['feed']}))
         if polls and count >= polls:
             break
-        delay = min(30, interval * (2 if not accepted else 1))
+        delay = min(30, max(1, interval * 2)) if not accepted else min(30, interval)
         if deadline is not None:
             delay = min(delay, max(0, deadline - clock()))
         if delay:
@@ -275,6 +280,8 @@ def main():
     run = subparsers.add_parser('run', help='Capture public data and run simulated orders')
     run.add_argument('--run-dir', type=Path, default=Path('data') / ('paper-' + uuid.uuid4().hex[:10]))
     run.add_argument('--instrument', default='BTC-USDT')
+    run.add_argument('--transport', choices=('rest', 'websocket'), default='rest')
+    run.add_argument('--reorder-ms', type=int, default=500)
     run.add_argument('--base-url', choices=BASE_URLS, default=DEFAULT_BASE_URL)
     run.add_argument('--dns-mode', choices=('system', 'doh'), default='system')
     run.add_argument('--polls', type=int, default=0, help='0 means continuous; positive values bound the run')
@@ -302,19 +309,30 @@ def main():
         parser.error('interval must be between 0.5 and 60 seconds, polls nonnegative, and stale-ms positive')
     if args.duration_seconds is not None and (not math.isfinite(args.duration_seconds) or args.duration_seconds <= 0):
         parser.error('duration-seconds must be finite and positive')
-    client = OKXPublic(args.instrument, base_url=args.base_url, dns_mode=args.dns_mode)
+    if args.transport == 'websocket':
+        from .okx_stream import OKXStream
+        from .stream_paper import StreamPaperRunner
+        if not 0 <= args.reorder_ms < args.stale_ms:
+            parser.error('reorder-ms must be nonnegative and less than stale-ms')
+        try:
+            client = OKXStream(args.instrument, dns_mode=args.dns_mode)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        client = OKXPublic(args.instrument, base_url=args.base_url, dns_mode=args.dns_mode)
     config = Config(order_size=args.order_size, max_inventory=args.max_inventory, fee_bps=args.fee_bps)
     execution = Execution(args.latency_ms, args.participation, args.queue_ahead)
     try:
         store = PaperStore(args.run_dir, {'version': 1, 'instrument': args.instrument,
                                         'config': asdict(config), 'execution': asdict(execution),
-                                        'stale_ms': args.stale_ms, 'source': 'OKX public REST', 'base_url': args.base_url, 'dns_mode': args.dns_mode,
+                                        'stale_ms': args.stale_ms, 'source': 'OKX public WebSocket' if args.transport == 'websocket' else 'OKX public REST', 'transport': args.transport, 'reorder_ms': args.reorder_ms if args.transport == 'websocket' else None, 'base_url': args.base_url, 'dns_mode': args.dns_mode,
                                         'model': 'passive-trade-replay-v1; held prior REST book approximation',
-                                    'alignment_model': 'trade-watermark-v1',
+                                    'alignment_model': 'bounded-reorder-v1' if args.transport == 'websocket' else 'trade-watermark-v1',
                                         'collection': {'polls': args.polls, 'duration_seconds': args.duration_seconds, 'interval_seconds': args.interval}})
     except FileExistsError:
         parser.error(f'Run directory already exists: {args.run_dir}. Omit --run-dir to generate a fresh directory, or choose a new path.')
-    runner = PaperRunner(store, args.instrument, config, execution, args.stale_ms)
+    runner = (StreamPaperRunner(store, args.instrument, config, execution, args.stale_ms, reorder_ms=args.reorder_ms)
+              if args.transport == 'websocket' else PaperRunner(store, args.instrument, config, execution, args.stale_ms))
     http = worker = None
     successful_polls = 0
     try:
@@ -329,7 +347,7 @@ def main():
             worker.start()
             print(f'Paper dashboard: http://127.0.0.1:{args.port}', flush=True)
         print(f'Public data / simulated orders. Journal: {args.run_dir / "paper.sqlite3"}', flush=True)
-        collection = collect(runner, client, args.polls, args.duration_seconds, args.interval)
+        collection = collect(runner, client, args.polls, args.duration_seconds, 0 if args.transport == 'websocket' else args.interval)
         successful_polls = collection['successful_polls']
     except KeyboardInterrupt:
         successful_polls = int(runner.feed.received_ms is not None)
@@ -338,12 +356,15 @@ def main():
             http.shutdown()
             http.server_close()
             worker.join()
+        if hasattr(client, 'close'):
+            client.close()
         runner.close()
     from .capture_review import review
     report = review(args.run_dir / 'paper.sqlite3')
     with (args.run_dir / 'capture-review.json').open('x') as target:
         json.dump(report, target, indent=2, allow_nan=False)
     print(f'Capture review: {report["status"]}; {args.run_dir / "capture-review.json"}', flush=True)
+    print('Offline review command: ' + shlex.join([sys.executable, '-m', 'app.pipeline', str((args.run_dir / 'paper.sqlite3').resolve())]), flush=True)
     if (args.polls or args.duration_seconds is not None) and not successful_polls:
         parser.exit(2, 'No fresh market data was accepted; inspect the journal and network connectivity.\n')
 

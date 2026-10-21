@@ -23,6 +23,8 @@ def timestamp():
 def run_pipeline(journal, output_dir, registry_path=DEFAULT_REGISTRY, criteria=None):
     criteria = criteria or Criteria()
     source = Path(journal).resolve()
+    if not source.is_file():
+        raise ValueError(f'Capture journal not found: {journal}. Use the printed paper.sqlite3 path from a completed capture; ACTUAL_JOURNAL_PATH is a placeholder. Find saved captures with python3 -m app.operations.')
     workspace = Path(output_dir).resolve()
     workspace.mkdir(parents=True, exist_ok=False)
     state = {'workflow_version': 1, 'status': 'running', 'phase': 'initializing',

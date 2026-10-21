@@ -116,3 +116,7 @@ The 30-poll alignment-validation run had 1,126 processed trades: 346 did not rea
 ## Timed collection
 
 Use `--duration-seconds` to bound longer runs; a normal stop writes `capture-review.json` automatically. See [timed collection and capture review](COLLECTION.md) for limits, per-segment research criteria, configurable thresholds, and automation exit codes.
+
+## Optional streaming transport
+
+Use `--transport websocket` with the project-local pinned dependency for bounded event-time reordering instead of REST trade-watermark waiting. See [WebSocket setup and continuity limits](WEBSOCKET_FEED.md). REST remains available for comparison, and neither path guarantees complete exchange sequencing.
