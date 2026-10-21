@@ -112,3 +112,7 @@ The report includes outcome counts, classification provenance, per-segment activ
 Older runs have no explicit outcome field. Their classifications are labelled `inferred_from_saved_state`; reachable but unfilled historical quotes remain `unfilled_reachable_quote` rather than assigning an unobserved queue or latency cause. Rows with no active quote cannot establish why it was absent. Gap-skipped and warm-up trades are outside the processed trade totals.
 
 The 30-poll alignment-validation run had 1,126 processed trades: 346 did not reach a saved active limit, and 780 had no active quote on the relevant side. It had no fills and its account reconciled. The configured half spread was 12 bps, while the processed-row mean full market spread was about 0.01188 bps; these figures describe different widths and do not establish profitable quoting settings. Execution settings remain unchanged pending longer data collection and calibration to observed fills.
+
+## Timed collection
+
+Use `--duration-seconds` to bound longer runs; a normal stop writes `capture-review.json` automatically. See [timed collection and capture review](COLLECTION.md) for limits, per-segment research criteria, configurable thresholds, and automation exit codes.

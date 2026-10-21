@@ -79,6 +79,14 @@ python3 -m app.evaluate run data/study.lock.json --output data/study-report.json
 
 Freeze hashes datasets and effective scenario settings. Run verifies them, evaluates each segment with a separate account, and reports agent/baseline results by development, validation, or test role. See [study plans and interpretation](EVALUATION.md). The synthetic example demonstrates the workflow; scenarios remain illustrative execution assumptions.
 
+## Longer capture and quality checks
+
+```bash
+python3 -m app.paper run --dns-mode doh --duration-seconds 1800
+```
+
+Timed runs stop automatically and save `capture-review.json` beside their journal. The review checks each continuity segment against explicit duration, trade-count, event-spacing, feed-health and alignment criteria, with accounting verification. See [collection and review criteria](COLLECTION.md). Passing data checks does not establish strategy profitability or calibrate real exchange fills.
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
