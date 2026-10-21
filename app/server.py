@@ -10,10 +10,12 @@ import threading
 from urllib.parse import urlsplit
 from .storage import JournalError, PersistentEngine
 from .experiments import DEFAULT_REGISTRY, read_runs
+from .operations import snapshot as operations_snapshot
 
 engine = None
 worker_error = None
 registry_path = DEFAULT_REGISTRY
+data_dir = Path('data')
 
 
 def state():
@@ -33,7 +35,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path == '/api/experiments' or path.startswith('/api/experiments/'):
+        if path == '/api/operations':
+            try:
+                result = operations_snapshot(data_dir, registry_path, state() if engine is not None else None)
+                self.respond(200, json.dumps(result).encode())
+            except (OSError, ValueError, KeyError, TypeError):
+                self.respond(503, b'{"error":"Operations summary unavailable"}')
+        elif path == '/api/experiments' or path.startswith('/api/experiments/'):
             identifier = path.removeprefix('/api/experiments/') if path != '/api/experiments' else None
             if identifier is not None and not re.fullmatch(r'[0-9a-f]{32}', identifier):
                 self.respond(404, b'{"error":"Experiment not found"}')
@@ -72,12 +80,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global engine, registry_path
+    global engine, registry_path, data_dir
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--registry', type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument('--journal', default='data/simulation.sqlite3')
     args = parser.parse_args()
     registry_path = args.registry
+    data_dir = args.data_dir
     engine = PersistentEngine(args.journal)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', 8000), Handler)

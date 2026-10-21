@@ -4,7 +4,7 @@
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0c121c;color:#e7eef8}body{max-width:1200px;margin:auto;padding:36px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:20px}h1{font-size:30px;letter-spacing:-1px;margin:0}p,.muted{color:#96a6bc;font-size:14px}.badge{color:#73e2bb;background:#17392f;border-radius:30px;padding:8px 14px;font-size:12px}button{border:1px solid #38475f;background:#1b293f;color:white;border-radius:8px;padding:10px 16px;cursor:pointer}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:30px 0}.card,section{background:#131e2d;border:1px solid #263449;border-radius:12px;padding:20px}.value{font-size:27px;margin-top:10px;font-variant-numeric:tabular-nums}.panels{display:grid;grid-template-columns:2fr 1fr;gap:16px}h2{font-size:16px;margin:0 0 20px}svg{width:100%;height:220px}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:12px 6px;border-bottom:1px solid #263449}th{color:#96a6bc;font-weight:500}.buy{color:#73e2bb}.sell{color:#ffb78e}.row{display:flex;justify-content:space-between;margin:20px 0}#error{color:#ffb78e}footer{margin-top:24px;color:#96a6bc;font-size:12px}@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}.panels{grid-template-columns:1fr}header{flex-wrap:wrap}}
 </style>
 <header><div><h1>Liquidity Lab<span style="color:#73e2bb">.</span></h1><p>Automated liquidity provision · Agent workspace</p></div><span class="badge" id="mode">SIMULATED MARKET</span><button id="toggle">Pause agent</button></header>
-<p id="error" role="status"></p><div class="grid" id="metrics"></div>
+<p id="error" role="status"></p><section style="margin-top:18px"><h2>Operations · next action</h2><p id="operations-action">Loading saved reports…</p><pre id="operations-command" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><p id="operations-summary" class="muted"></p><p id="operations-warning" class="muted"></p></section><div class="grid" id="metrics"></div>
 <div class="panels"><section><h2>Market price <span class="muted">/ <span id="market-unit">synthetic USD</span></span></h2><svg id="chart" viewBox="0 0 600 220" role="img" aria-label="Simulated market price history"></svg><p id="range" class="muted"></p></section><section><h2>Agent & risk controls</h2><div id="risk"></div><p id="feed-health" class="muted"></p><p id="execution-health" class="muted"></p><p class="muted">Inventory shifts the quote center. Buy orders stop at the inventory limit or when cash is insufficient. Sell orders require available inventory.</p></section></div>
 <section style="margin-top:16px"><h2>Recent simulated fills</h2><table><thead><tr><th>Tick</th><th>Side</th><th>Price</th><th>Quantity</th><th>Fee</th></tr></thead><tbody id="trades"></tbody></table></section>
 <section id="decisions-panel" style="margin-top:16px;display:none"><h2>Recent agent decisions</h2><table><thead><tr><th>Event</th><th>Arrival (ms)</th><th>Bid</th><th>Ask</th></tr></thead><tbody id="decisions"></tbody></table></section>
@@ -29,4 +29,15 @@ async function refreshExperiments(){
  }catch{el('experiment-status').textContent='Experiment registry unavailable. Retrying…'}
 }
 refreshExperiments();setInterval(refreshExperiments,5000);
+async function refreshOperations(){
+ try{
+  const response=await fetch('/api/operations');if(!response.ok)throw Error();const ops=await response.json();
+  el('operations-action').textContent=ops.next_action.label;
+  el('operations-command').textContent=ops.next_action.command||ops.next_action.artifact_path||'';
+  const capture=ops.latest_capture,workflow=ops.latest_workflow;
+  el('operations-summary').textContent=(capture?`Saved capture: ${capture.status} · Qualifying segments: ${capture.qualified_segments.length} · Failed checks: ${capture.failed_checks.join(', ')||'none'}`:'No saved capture review found.')+(workflow?` · Saved workflow: ${workflow.status} (${workflow.phase})`:'')+' · Recent experiment attempts: '+ops.recent_experiments.length;
+  el('operations-warning').textContent=ops.warnings.join(' ')+' Saved reports are not live feed health; revalidation happens in the workflow.';
+ }catch{el('operations-action').textContent='Operations summary unavailable. Retrying…';el('operations-command').textContent=''}
+}
+refreshOperations();setInterval(refreshOperations,5000);
 </script></html>

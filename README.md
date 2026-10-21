@@ -108,6 +108,10 @@ python3 -m app.pipeline data/paper-first/paper.sqlite3
 
 The workflow reviews a completed capture, stops when more data is needed, or prepares qualifying development segments, freezes a study, generates a bounded offline proposal and registers its evaluation. Each phase is checkpointed in a fresh workspace. See [pipeline commands, outputs and exit codes](PIPELINE.md).
 
+## Operations overview
+
+The dashboard now combines current feed health with saved capture reviews, workflow checkpoints and experiment attempts. Its read-only Operations panel suggests a concrete next action without starting work automatically. The same saved-artifact summary is available with `python3 -m app.operations`. See [discovery, freshness and next-action rules](OPERATIONS.md).
+
 ## Next implementation stages
 
 1. Complete: persist market events, quotes, fills, and agent decisions for replay and audit.
