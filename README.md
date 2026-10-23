@@ -127,3 +127,66 @@ An optional WebSocket transport now processes public book and trade updates thro
 Exchange trading requires a separate implementation and explicit operational configuration. This prototype has no credentials or live order route. Public market-data access depends on network reachability and exchange availability.
 
 Offline quote-width sensitivity is available with `python3 -m app.quote_study data/workflow-b6568a5d02/study.lock.json` when that local workflow exists. See [QUOTE_STUDY.md](QUOTE_STUDY.md) for development-only input rules, recorded results, and execution limitations.
+
+
+1. Discover and evaluate markets
+
+The system continuously evaluates eligible coins and trading pairs using market activity, spreads, liquidity, volatility, trading costs, and risk.
+
+
+
+
+2. Select the best opportunity
+
+It ranks candidate markets based on their expected risk-adjusted net returns from providing liquidity, rather than simply choosing the coin with the highest trading volume or most volatile price.
+
+
+
+
+3. Allocate available capital
+
+It decides how much capital to commit to each selected market, while reserving funds for fees, losses, inventory changes, and other risk limits.
+
+
+
+
+4. Provide and manage liquidity
+
+It places appropriate buy and sell quotes—or, if targeting a decentralized exchange, manages liquidity positions in a pool—and adjusts or removes them as market conditions change.
+
+
+
+
+5. Monitor, learn, and protect capital
+
+It tracks performance after fees and inventory losses, detects deteriorating conditions, updates its decisions using evidence, and stops or reduces exposure when risk limits are reached.
+
+
+The product we should build
+User account and wallet
+
+Account, identity verification, NGN deposits and balances
+
+Funding and conversion
+
+NGN → USDT, with verified rates, fees and transaction records
+
+AI pool selection and allocation
+
+Evaluate pools, forecast net fee income, assess risk and set capital limits
+
+DeFi liquidity engine
+
+Convert USDT into required token pairs and provide liquidity to selected pools
+
+Portfolio monitoring and accounting
+
+Track positions, earned fees, token values, losses, withdrawals and each user's share
+
+
+How we should implement this in our project
+I recommend making IL mitigation part of the AI's core decision process, with three pool categories:
+Pool category	Initial policy
+Stablecoin–stablecoin	Evaluate first as a lower-relative-price-risk candidate, while checking depeg and contract risks
+Correlated volatile assets	Evaluate for moderate divergence risk and fee potential
+Uncorrelated volatile assets	Apply stricter risk limits and require stronger evidence that fees compensate for divergence risk
