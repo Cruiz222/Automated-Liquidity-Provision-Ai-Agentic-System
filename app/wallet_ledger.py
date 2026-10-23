@@ -167,6 +167,36 @@ class WalletLedger:
                 self.db.execute("ROLLBACK")
                 raise
 
+    def withdraw(self, account: str, currency: str, amount_minor: int, idempotency_key: str) -> dict[str, Any]:
+        """Record a simulated withdrawal to clearing; no bank/on-chain payout occurs."""
+        self._validate_currency(currency)
+        _positive_int(amount_minor)
+        if not account or not idempotency_key:
+            raise InvalidOperation("account and idempotency_key are required")
+        request = {"account": account, "currency": currency, "amount_minor": amount_minor}
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._existing_operation(idempotency_key, request)
+                if existing is not None:
+                    self.db.execute("COMMIT")
+                    return existing
+                available = self.balance(account, currency)
+                if available < amount_minor:
+                    raise InsufficientFunds(f"insufficient {currency}: have {available}, need {amount_minor}")
+                op_id = f"withdraw:{idempotency_key}"
+                result = {"operation_id": op_id, "account": account, "currency": currency,
+                          "amount_minor": amount_minor, "status": "simulated"}
+                self._record_operation(op_id, idempotency_key, "withdrawal", request, result, [
+                    (account, currency, -amount_minor, "simulated withdrawal"),
+                    ("clearing", currency, amount_minor, "simulated withdrawal clearing"),
+                ])
+                self.db.execute("COMMIT")
+                return result
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
     def convert(self, source_account: str, target_account: str, source_currency: str,
                 target_currency: str, source_amount_minor: int, target_amount_minor: int,
                 idempotency_key: str) -> dict[str, Any]:
