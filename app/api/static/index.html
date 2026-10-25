@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquidity Lab (simulation)</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="banner" role="alert">SIMULATION ONLY. No real money, bank, exchange or blockchain is involved. Pool data is synthetic example data, not market data. Balances, rates and returns shown here are not real.</div>
+<header>
+  <h1>Liquidity Lab</h1>
+  <div id="who" hidden><span id="username"></span> <button id="logout" class="ghost">Log out</button></div>
+</header>
+<div id="msg" role="status" aria-live="polite"></div>
+
+<main id="auth">
+  <section class="card narrow">
+    <div class="tabs"><button data-auth="login" class="on">Log in</button><button data-auth="register">Register</button></div>
+    <form id="login-form" data-form="login">
+      <label>Username <input name="username" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Log in</button>
+    </form>
+    <form id="register-form" data-form="register" hidden>
+      <label>Username <input name="username" autocomplete="username" required minlength="3" maxlength="32"></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="128"></label>
+      <p class="hint">12 or more characters. Usernames: letters, digits, . _ -</p>
+      <button type="submit">Create account</button>
+    </form>
+  </section>
+</main>
+
+<main id="app" hidden>
+  <nav id="nav">
+    <button data-view="overview" class="on">Overview</button><button data-view="wallet">Wallet</button>
+    <button data-view="convert">Convert</button><button data-view="pools">Pools</button>
+    <button data-view="positions">Positions</button><button data-view="history">History</button>
+    <button data-view="security">Security</button>
+  </nav>
+
+  <section data-panel="overview">
+    <div class="grid" id="balances"></div>
+    <div class="card"><h2>Portfolio value</h2><div id="valuation"></div></div>
+    <div class="card"><h2>Simulation settings</h2><div id="simnote" class="hint"></div></div>
+  </section>
+
+  <section data-panel="wallet" hidden>
+    <div class="card"><h2>Simulated deposit</h2>
+      <form data-form="deposit" class="row">
+        <label>Currency <select name="currency"><option>NGN</option><option>USDT</option></select></label>
+        <label>Amount <input name="amount" inputmode="decimal" required></label>
+        <button type="submit">Add simulated funds</button>
+      </form><p class="hint" id="deposit-limits"></p></div>
+    <div class="card"><h2>Withdraw (simulated payout)</h2>
+      <form data-form="withdraw" class="row">
+        <label>Currency <select name="currency" id="wd-currency"><option>NGN</option><option>USDT</option></select></label>
+        <label>Amount <input name="amount" inputmode="decimal" required></label>
+        <span id="wd-ngn" class="row"><label>Bank code <input name="bank_code" maxlength="6"></label><label>Account number <input name="account_number" maxlength="10"></label></span>
+        <span id="wd-usdt" class="row" hidden><label>Network <select name="network"><option>TRC20</option><option>ERC20</option><option>BEP20</option><option>POLYGON</option><option>ARBITRUM</option><option>BASE</option><option>OPTIMISM</option></select></label><label>Address <input name="address" maxlength="64"></label></span>
+        <button type="submit">Request withdrawal</button>
+      </form><p class="hint">Funds and the fee are reserved immediately. Nothing is sent anywhere.</p>
+      <table id="withdrawals"></table></div>
+  </section>
+
+  <section data-panel="convert" hidden>
+    <div class="card"><h2>Convert NGN and USDT</h2>
+      <form data-form="quote" class="row">
+        <label>Direction <select name="source"><option value="NGN">NGN to USDT</option><option value="USDT">USDT to NGN</option></select></label>
+        <label>Amount to convert <input name="amount" inputmode="decimal" required></label>
+        <button type="submit">Get quote</button>
+      </form><div id="quote"></div></div>
+  </section>
+
+  <section data-panel="pools" hidden>
+    <div class="card"><h2>Pool screening</h2><div class="scroll"><table id="pools"></table></div></div>
+    <div class="card"><h2>Suggested allocation</h2>
+      <form data-form="recommend" class="row"><label>USDT to allocate <input name="amount" inputmode="decimal" required></label><button type="submit">Suggest</button></form>
+      <div id="recommendation"></div></div>
+    <div class="card"><h2>What if the price moves?</h2>
+      <form data-form="scenario" class="row"><label>Pool <select name="pool" id="scenario-pool"></select></label>
+        <label>Price change % <input name="pct" value="-30" inputmode="decimal"></label><button type="submit">Calculate</button></form>
+      <div id="scenario"></div></div>
+  </section>
+
+  <section data-panel="positions" hidden>
+    <div class="card"><h2>Open a position</h2>
+      <form data-form="open" class="row"><label>Pool <select name="pool" id="open-pool"></select></label>
+        <label>USDT <input name="amount" inputmode="decimal" required></label><button type="submit">Open position</button></form>
+      <p class="hint" id="position-note"></p></div>
+    <div class="card"><h2>Your positions</h2><div class="scroll"><table id="positions"></table></div></div>
+  </section>
+
+  <section data-panel="history" hidden>
+    <div class="card"><h2>Transaction history</h2><div class="scroll"><table id="history"></table></div><button id="more" class="ghost" hidden>Load more</button></div>
+  </section>
+
+  <section data-panel="security" hidden>
+    <div class="card"><h2>Change password</h2>
+      <form data-form="password" class="row"><label>Current <input name="current" type="password" autocomplete="current-password" required></label>
+        <label>New <input name="next" type="password" autocomplete="new-password" required minlength="12"></label><button type="submit">Change</button></form>
+      <p class="hint">Changing your password signs out your other sessions.</p>
+      <button id="logout-all" class="ghost">Sign out everywhere</button></div>
+    <div class="card"><h2>Recent account activity</h2><table id="activity"></table></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
