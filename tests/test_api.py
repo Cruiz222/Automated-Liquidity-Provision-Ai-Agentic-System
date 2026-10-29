@@ -11,7 +11,7 @@ except ImportError:
     from api_client import Client, PASSWORD, RunningServer
 
 STATIC = Path(__file__).resolve().parent.parent / "app" / "api" / "static"
-BANK = {"bank_code": "058", "account_number": "0123456789"}
+BANK = {"bank_code": "058", "account_number": "0123456785"}
 USDC_POOL = "usdc-usdt-arbitrum-1bp"
 
 
@@ -63,7 +63,7 @@ class TestFlows(ApiCase):
         self.assertIn("Secure", headers["Set-Cookie"])
 
     def test_full_customer_journey(self):
-        a = self.alice
+        a = self.alice.verify_kyc()
         self.assertEqual(a.post("/api/wallet/deposits", {"currency": "NGN", "amount_minor": 300_000_000}, key=True)[0], 200)
         status, quote, _ = a.post("/api/quotes", {"source_currency": "NGN", "amount_minor": 200_000_000})
         self.assertEqual(status, 201)
@@ -284,7 +284,7 @@ class TestMoneyEndpointSafety(ApiCase):
         self.assertEqual(self.alice.get("/api/wallet")[1]["balances"]["USDT"], 1_000_000)
 
     def test_other_users_cannot_touch_my_resources(self):
-        a = self.alice
+        a = self.alice.verify_kyc()
         a.post("/api/wallet/deposits", {"currency": "NGN", "amount_minor": 200_000_000}, key=True)
         a.post("/api/wallet/deposits", {"currency": "USDT", "amount_minor": 2_000_000_000}, key=True)
         withdrawal = a.post("/api/withdrawals", {"currency": "NGN", "amount_minor": 10_000_000, "destination": BANK}, key=True)[1]
@@ -346,6 +346,17 @@ class TestFrontEndHygiene(unittest.TestCase):
         self.assertIsNone(re.search(r"\sstyle\s*=", html))
         self.assertIsNone(re.search(r"(src|href)=[\"']https?://", html))
         self.assertNotIn("style=", (STATIC / "app.js").read_text())          # blocked by the CSP anyway
+
+    def test_recovery_codes_are_gone_from_the_interface(self):
+        for name in ("index.html", "app.js"):
+            self.assertNotIn("recovery", (STATIC / name).read_text().lower(), name)
+
+    def test_every_money_action_asks_for_the_pin(self):
+        js = (STATIC / "app.js").read_text()
+        for needle in ('"/api/wallet/deposits", await withPin', '"/api/withdrawals", await withPin', '"/api/positions", await withPin',
+                       '"/execute", await withPin', '"/api/payouts/accounts", await withPin', '"/api/live/deposits", await withPin',
+                       '"Open these positions")', '"Close this position")', '"Remove this payout account")'):
+            self.assertIn(needle, js, needle)
 
     def test_resource_ids_are_not_percent_encoded_in_paths(self):
         # Ids use only [A-Za-z0-9_.:-]; the strict router does not decode %3A, so encoding them would 404.

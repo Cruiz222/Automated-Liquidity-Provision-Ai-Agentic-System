@@ -12,7 +12,8 @@ import time
 import uuid
 from typing import Any, Callable
 
-from ..ledger import IdempotencyConflict, InsufficientFunds, InvalidOperation, WalletLedger, ensure_columns
+from ..ledger import (IdempotencyConflict, InsufficientFunds, InvalidOperation, LimitExceeded, WalletLedger,
+                      ensure_columns)
 
 
 class PositionNotFound(LookupError):
@@ -55,6 +56,9 @@ class LiquidityPositions:
                 "realized_pnl_minor": "INTEGER",
                 "entry_price": "REAL",
                 "opened_ts": "REAL",
+                "entry_price0_usd": "REAL",
+                "entry_price1_usd": "REAL",
+                "external_ref": "TEXT",
             })
             self.db.execute("""
                 CREATE TABLE IF NOT EXISTS position_marks (
@@ -68,7 +72,9 @@ class LiquidityPositions:
                 )""")
 
     def open_position(self, account: str, pool_id: str, asset: str, target_currency: str,
-                      amount_minor: int, idempotency_key: str, entry_price: float | None = None) -> dict[str, Any]:
+                      amount_minor: int, idempotency_key: str, entry_price: float | None = None,
+                      entry_prices: tuple[float | None, float | None] = (None, None),
+                      pool_capacity_minor: int | None = None) -> dict[str, Any]:
         """Fund a position from the account's USDT. ``asset``/``target_currency`` name the pool's two tokens."""
         if not account or not pool_id or not asset or not target_currency or not idempotency_key:
             raise ValueError("account, pool_id, asset, target_currency and idempotency_key are required")
@@ -87,6 +93,12 @@ class LiquidityPositions:
             available = self.ledger.balance(account, "USDT")
             if available < amount_minor:
                 raise InsufficientFunds(f"insufficient USDT: have {available}, need {amount_minor}")
+            if pool_capacity_minor is not None:       # checked inside the transaction, so concurrent opens cannot overfill
+                used = int(self.db.execute(
+                    "SELECT COALESCE(SUM(principal_minor), 0) FROM liquidity_positions WHERE pool_id = ? AND status != 'closed'",
+                    (pool_id,)).fetchone()[0])
+                if used + amount_minor > pool_capacity_minor:
+                    raise LimitExceeded(f"pool capacity reached: at most {pool_capacity_minor} micro-USDT in total ({used} already placed)")
             position_id = str(uuid.uuid4())
             op_id = f"open-position:{idempotency_key}"
             result = {"operation_id": op_id, "position_id": position_id, "account": account,
@@ -98,9 +110,9 @@ class LiquidityPositions:
             self.db.execute(
                 "INSERT INTO liquidity_positions(position_id, account, pool_id, principal_minor, "
                 "current_value_minor, accrued_fees_minor, status, idempotency_key, asset, quote_asset, "
-                "entry_price, opened_ts) VALUES (?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?, ?)",
+                "entry_price, opened_ts, entry_price0_usd, entry_price1_usd) VALUES (?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?, ?, ?, ?)",
                 (position_id, account, pool_id, amount_minor, amount_minor, idempotency_key, asset,
-                 target_currency, entry_price, self.clock()))
+                 target_currency, entry_price, self.clock(), entry_prices[0], entry_prices[1]))
             return result
 
     def mark_to_market(self, position_id: str, current_value_minor: int, accrued_fees_minor: int = 0,
@@ -169,6 +181,10 @@ class LiquidityPositions:
             return int(self.db.execute(
                 "SELECT COALESCE(SUM(principal_minor), 0) FROM liquidity_positions WHERE pool_id = ? AND status != 'closed'",
                 (pool_id,)).fetchone()[0])
+
+    def set_external_ref(self, position_id: str, external_ref: str) -> None:
+        with self.ledger.lock:
+            self.db.execute("UPDATE liquidity_positions SET external_ref = ? WHERE position_id = ?", (external_ref, position_id))
 
     def count_open(self, account: str) -> int:
         with self.ledger.lock:

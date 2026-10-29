@@ -1,13 +1,9 @@
 __pycache__/
-*.py[cod]
 .venv/
+venv/
 .env
 data/
 
-# Python virtual environments
-venv/
-.venv/
-
-# Python virtual environments
-venv/
-.venv/
+# Backup and archive files
+*.bak
+*.zip

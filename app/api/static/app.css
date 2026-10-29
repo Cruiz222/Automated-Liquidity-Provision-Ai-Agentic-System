@@ -16,3 +16,8 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;p
 #msg{max-width:1100px;margin:0 auto 8px;padding:0 16px;min-height:22px;font-weight:600}#msg.err{color:var(--bad)}#msg.ok{color:var(--good)}
 .pill{display:inline-block;padding:1px 8px;border-radius:10px;border:1px solid var(--line);font-size:12px}.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 16px}
 .mt{margin:12px 0}.pre{white-space:pre-wrap}
+[hidden]{display:none !important}
+.banner.live{background:#b45309}.banner.demo-live{background:#1d4ed8}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-right:10px}.seg button{border-radius:0;background:transparent;color:var(--ink)}.seg button.on{background:var(--acc);color:#fff}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}.overlay .card{margin:0;width:100%}
+.req{display:flex;gap:8px;margin:4px 0}.req b{min-width:1.2em}.ok{color:var(--good)}.no{color:var(--bad)}

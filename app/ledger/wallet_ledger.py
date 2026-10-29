@@ -131,6 +131,11 @@ class WalletLedger:
         self._lock = threading.RLock()
         self.lock = self._lock          # shared by services that use this connection
         self.db = sqlite3.connect(self.database, check_same_thread=False, isolation_level=None)
+        if self.database != ":memory:":
+            try:
+                Path(self.database).chmod(0o600)        # owner-only: the file holds balances, hashes and 2FA secrets
+            except OSError:
+                pass
         self.db.row_factory = sqlite3.Row
         with self._lock:
             self.db.execute("PRAGMA foreign_keys = ON")
@@ -494,7 +499,8 @@ class WalletLedger:
             return [self._withdrawal_dict(row) for row in rows]
 
     def request_withdrawal(self, account: str, currency: str, amount_minor: int,
-                           destination: dict[str, str], idempotency_key: str) -> dict[str, Any]:
+                           destination: dict[str, str], idempotency_key: str,
+                           limits: CurrencyLimits | None = None) -> dict[str, Any]:
         """Reserve funds (amount plus fee) for a payout; the funds leave the usable balance at once."""
         self._check_user_account(account)
         self._validate_currency(currency)
@@ -502,7 +508,7 @@ class WalletLedger:
         if not idempotency_key or not isinstance(idempotency_key, str):
             raise InvalidOperation("idempotency_key is required")
         dest = _validate_destination(currency, destination)
-        limits = self.withdrawal_limits[currency]
+        limits = limits or self.withdrawal_limits[currency]
         request = {"account": account, "currency": currency, "amount_minor": amount_minor, "destination": dest}
         with self.transaction():
             existing = self._existing_operation(idempotency_key, request)

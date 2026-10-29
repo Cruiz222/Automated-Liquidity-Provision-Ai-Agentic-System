@@ -1,0 +1,159 @@
+"""Live pool data from DefiLlama's public APIs (read-only, no key).
+
+* ``https://yields.llama.fi/pools``: pool list with TVL, base (fee) APY, volumes, token addresses, fee tier.
+* ``https://coins.llama.fi/prices/current/{coins}`` and ``/chart/{coins}``: USD prices and daily price history,
+  with coins addressed as ``chain:0xaddress``.
+
+Response shapes follow DefiLlama's published API documentation. The parsers are tolerant (rows that do not fit are
+skipped) but the provider is strict about trust: a pool without a recent, confident price for both tokens carries
+no USD price and, if volatile, no price history, so the selector excludes it instead of guessing. Run
+``python3 -m app.feedcheck`` on a machine with internet access to confirm the live responses still parse.
+"""
+from __future__ import annotations
+
+import math
+import time
+from collections import Counter
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Iterable
+from urllib.parse import quote
+
+from .http import ProviderError, fetch_json
+from .pool_data import PoolSnapshot, parse_defillama_pools
+
+POOLS_URL = "https://yields.llama.fi/pools"
+CURRENT_URL = "https://coins.llama.fi/prices/current/{coins}"
+CHART_URL = "https://coins.llama.fi/chart/{coins}?span={span}&period=1d"
+
+# DefiLlama chain names -> the prefix its coins API expects.
+CHAIN_PREFIX = {"ethereum": "ethereum", "arbitrum": "arbitrum", "base": "base", "polygon": "polygon",
+                "optimism": "optimism", "bsc": "bsc", "avalanche": "avax"}
+DEFAULT_CHAINS = ("ethereum", "arbitrum", "base", "polygon", "optimism")
+# Two-token AMM projects whose pools the full-range model approximates. v3-style pools are flagged by the selector.
+DEFAULT_PROJECTS = ("uniswap-v2", "uniswap-v3", "sushiswap", "aerodrome-v1", "aerodrome-slipstream", "pancakeswap-amm")
+DEFAULT_TOKENS = frozenset({"USDC", "USDT", "DAI", "WETH", "ETH", "WBTC", "CBBTC", "STETH", "WSTETH", "CBETH", "RETH"})
+MIN_PRICE_CONFIDENCE = 0.8
+BATCH = 30                                   # coins per price request (keeps URLs short)
+
+
+@dataclass(frozen=True)
+class PoolUniverse:
+    """Which pools may be considered at all. Everything else is ignored before scoring."""
+    chains: tuple[str, ...] = DEFAULT_CHAINS
+    projects: tuple[str, ...] = DEFAULT_PROJECTS
+    tokens: frozenset[str] = DEFAULT_TOKENS
+    min_tvl_usd: float = 5_000_000.0
+    max_pools: int = 40
+    history_days: int = 30
+
+
+def _symbols(row: dict[str, Any]) -> list[str]:
+    return [t.strip().upper() for t in str(row.get("symbol", "")).replace("/", "-").split("-") if t.strip()]
+
+
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+class DefiLlamaPoolProvider:
+    def __init__(self, universe: PoolUniverse | None = None, fetch: Callable[[str], Any] = fetch_json,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.universe, self._fetch, self._clock = universe or PoolUniverse(), fetch, clock
+        self.last_report: dict[str, Any] = {}
+
+    # ---- universe filter -------------------------------------------------------
+    def _eligible_rows(self, rows: Iterable[Any]) -> list[dict[str, Any]]:
+        u, kept = self.universe, []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("outlier") or row.get("exposure") == "single":
+                continue
+            if str(row.get("chain", "")).lower() not in u.chains or row.get("project") not in u.projects:
+                continue
+            symbols = _symbols(row)
+            if len(symbols) != 2 or not all(s in u.tokens for s in symbols):
+                continue
+            tvl = row.get("tvlUsd")
+            if _finite(tvl) and tvl >= u.min_tvl_usd:
+                kept.append(row)
+        kept.sort(key=lambda r: -r["tvlUsd"])
+        return kept[: u.max_pools]
+
+    # ---- prices -------------------------------------------------------------------
+    @staticmethod
+    def _coin_ids(snapshot: PoolSnapshot) -> list[str] | None:
+        prefix = CHAIN_PREFIX.get(snapshot.chain.lower())
+        if prefix is None or len(snapshot.token_addresses) != 2:
+            return None
+        return [f"{prefix}:{address}" for address in snapshot.token_addresses]
+
+    def _batches(self, ids: list[str]) -> list[str]:
+        unique = sorted(set(ids))
+        return [",".join(quote(i, safe=":,") for i in unique[k:k + BATCH]) for k in range(0, len(unique), BATCH)]
+
+    def _current_prices(self, ids: list[str]) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        for batch in self._batches(ids):
+            try:
+                coins = self._fetch(CURRENT_URL.format(coins=batch)).get("coins", {})
+            except (ProviderError, AttributeError):
+                continue                          # missing prices exclude pools later; never guessed
+            for coin, record in coins.items():
+                if isinstance(record, dict) and _finite(record.get("price")) and record["price"] > 0 \
+                        and _finite(record.get("confidence", 1.0)) and record.get("confidence", 1.0) >= MIN_PRICE_CONFIDENCE:
+                    prices[coin.lower()] = float(record["price"])
+        return prices
+
+    def _charts(self, ids: list[str]) -> dict[str, list[tuple[float, float]]]:
+        charts: dict[str, list[tuple[float, float]]] = {}
+        for batch in self._batches(ids):
+            try:
+                coins = self._fetch(CHART_URL.format(coins=batch, span=self.universe.history_days)).get("coins", {})
+            except (ProviderError, AttributeError):
+                continue
+            for coin, record in coins.items():
+                points = record.get("prices") if isinstance(record, dict) else None
+                if isinstance(points, list):
+                    series = sorted((float(p["timestamp"]), float(p["price"])) for p in points
+                                    if isinstance(p, dict) and _finite(p.get("timestamp")) and _finite(p.get("price")) and p["price"] > 0)
+                    if series:
+                        charts[coin.lower()] = series
+        return charts
+
+    @staticmethod
+    def _ratio_series(first: list[tuple[float, float]], second: list[tuple[float, float]], tolerance: float = 12 * 3600) -> list[float]:
+        """Daily token0/token1 price: pair each point of the first series with the nearest second-series point."""
+        out, j = [], 0
+        for ts, price in first:
+            while j + 1 < len(second) and abs(second[j + 1][0] - ts) <= abs(second[j][0] - ts):
+                j += 1
+            if abs(second[j][0] - ts) <= tolerance:
+                out.append(price / second[j][1])
+        return out
+
+    # ---- main entry ------------------------------------------------------------------
+    def fetch_pools(self) -> list[PoolSnapshot]:
+        payload = self._fetch(POOLS_URL)
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ProviderError("pool list response has no 'data' list")
+        chosen = self._eligible_rows(rows)
+        snapshots = parse_defillama_pools({"data": chosen}, as_of=self._clock(), min_tvl_usd=self.universe.min_tvl_usd)
+        if not snapshots:
+            raise ProviderError("no pool passed the universe filter; check the chain, project and token settings")
+        ids = [i for s in snapshots if (pair := self._coin_ids(s)) for i in pair]
+        prices, charts = self._current_prices(ids), self._charts(ids)
+        out, priced, with_history = [], 0, 0
+        for snapshot in snapshots:
+            pair = self._coin_ids(snapshot)
+            p0, p1 = (prices.get(pair[0].lower()), prices.get(pair[1].lower())) if pair else (None, None)
+            history: list[float] = []
+            if pair and pair[0].lower() in charts and pair[1].lower() in charts:
+                history = self._ratio_series(charts[pair[0].lower()], charts[pair[1].lower()])
+            priced += bool(p0 and p1)
+            with_history += len(history) >= 14
+            out.append(replace(snapshot, price0_usd=p0, price1_usd=p1, price_history=tuple(history),
+                               source="defillama (yields.llama.fi, coins.llama.fi)"))
+        seen = Counter(r.get("project") for r in rows if isinstance(r, dict) and str(r.get("chain", "")).lower() in self.universe.chains)
+        self.last_report = {"rows": len(rows), "after_filter": len(chosen), "snapshots": len(out), "with_usd_prices": priced,
+                            "with_price_history": with_history, "projects_on_chosen_chains": dict(seen.most_common(15))}
+        return out

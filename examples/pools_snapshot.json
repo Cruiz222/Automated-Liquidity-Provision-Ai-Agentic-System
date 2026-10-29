@@ -5,7 +5,7 @@
   {
    "pool_id": "usdc-usdt-arbitrum-1bp",
    "chain": "arbitrum",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "USDC",
    "token1": "USDT",
    "fee_tier_bps": 1,
@@ -51,7 +51,7 @@
   {
    "pool_id": "dai-usdc-polygon-5bp",
    "chain": "polygon",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "DAI",
    "token1": "USDC",
    "fee_tier_bps": 5,
@@ -97,7 +97,7 @@
   {
    "pool_id": "weth-cbeth-base-5bp",
    "chain": "base",
-   "dex": "aerodrome",
+   "dex": "example-amm",
    "token0": "WETH",
    "token1": "CBETH",
    "fee_tier_bps": 5,
@@ -143,7 +143,7 @@
   {
    "pool_id": "weth-usdc-arbitrum-5bp",
    "chain": "arbitrum",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "WETH",
    "token1": "USDC",
    "fee_tier_bps": 5,
@@ -189,7 +189,7 @@
   {
    "pool_id": "wbtc-usdc-arbitrum-5bp",
    "chain": "arbitrum",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "WBTC",
    "token1": "USDC",
    "fee_tier_bps": 5,
@@ -235,7 +235,7 @@
   {
    "pool_id": "weth-usdc-ethereum-5bp",
    "chain": "ethereum",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "WETH",
    "token1": "USDC",
    "fee_tier_bps": 5,
@@ -281,7 +281,7 @@
   {
    "pool_id": "newfi-usdc-base-30bp",
    "chain": "base",
-   "dex": "aerodrome",
+   "dex": "example-amm",
    "token0": "NEWFI",
    "token1": "USDC",
    "fee_tier_bps": 30,
@@ -327,7 +327,7 @@
   {
    "pool_id": "pepe-weth-ethereum-30bp",
    "chain": "ethereum",
-   "dex": "uniswap-v3",
+   "dex": "example-amm",
    "token0": "PEPE",
    "token1": "WETH",
    "fee_tier_bps": 30,

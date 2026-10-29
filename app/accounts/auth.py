@@ -23,8 +23,10 @@ import sqlite3
 import time
 from typing import Any, Callable
 
-from ..ledger import SYSTEM_ACCOUNTS, WalletLedger
+from ..ledger import SYSTEM_ACCOUNTS, WalletLedger, ensure_columns
+from . import totp
 from .limits import RateLimited, RateLimiter
+from .mail import ConsoleMailer, Mailer
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
 RESERVED_USERNAMES = frozenset(SYSTEM_ACCOUNTS | {"admin", "administrator", "root", "system", "support", "staff",
@@ -35,6 +37,18 @@ COMMON_PASSWORDS = frozenset({
     "abcdefghijkl", "123412341234", "000000000000", "111111111111",
 })
 MAX_HASH_ITERATIONS = 5_000_000
+PIN_PATTERN = re.compile(r"^\d{6}$")
+WEAK_PINS = frozenset({"123123", "112233", "121212", "654321", "000123", "696969", "147258", "159753", "789456",
+                       "123321", "111222", "202020", "010101", "000111", "999000", "100000", "123000", "246810"})
+
+
+def validate_pin(pin: Any) -> str:
+    if not isinstance(pin, str) or not PIN_PATTERN.fullmatch(pin):
+        raise ValidationError("PIN must be exactly 6 digits")
+    steps = {(int(b) - int(a)) % 10 for a, b in zip(pin, pin[1:])}
+    if len(set(pin)) <= 2 or steps <= {1} or steps <= {9} or pin in WEAK_PINS:
+        raise ValidationError("choose a PIN that is not a repeat, a sequence or a common pattern")
+    return pin
 
 
 class AccountError(Exception):
@@ -51,6 +65,33 @@ class AuthError(AccountError):
 
 class ConflictError(AccountError):
     pass
+
+
+class OtpRequired(AuthError):
+    """The password was right but an authenticator code is needed."""
+
+
+class PinNotSet(AccountError):
+    """The customer has not set a transaction PIN yet."""
+
+
+class PinRequired(AccountError):
+    """A transaction PIN is needed for this action but none was supplied."""
+
+
+class InvalidPin(AccountError):
+    """The PIN was wrong."""
+
+
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+CODE_TTL = 900
+MAX_CODE_ATTEMPTS = 5
+
+
+def validate_email(email: Any) -> str:
+    if not isinstance(email, str) or len(email) > 254 or not EMAIL_PATTERN.fullmatch(email.strip()):
+        raise ValidationError("enter a valid email address")
+    return email.strip()
 
 
 def _b64(data: bytes) -> str:
@@ -103,10 +144,15 @@ class AccountStore:
     def __init__(self, ledger: WalletLedger, *, password_iterations: int = 600_000, session_ttl: float = 8 * 3600,
                  session_idle: float = 3600, max_sessions: int = 5, login_max_failures: int = 5,
                  login_lock_seconds: float = 900, clock: Callable[[], float] = time.time,
-                 limiter_clock: Callable[[], float] = time.monotonic) -> None:
+                 limiter_clock: Callable[[], float] = time.monotonic, mailer: Mailer | None = None,
+                 issuer: str = "Liquidity Lab", pin_pepper: bytes = b"") -> None:
         self.ledger, self.db = ledger, ledger.db
         self.iterations, self.session_ttl, self.session_idle = password_iterations, session_ttl, session_idle
         self.max_sessions, self.clock = max_sessions, clock
+        self.mailer, self.issuer = mailer or ConsoleMailer(), issuer
+        self.audit_context: Callable[[], dict[str, Any]] = lambda: {}
+        self.pin_pepper = pin_pepper     # server-side secret kept outside the database (see service.load_secret)
+        self.mail_limiter = RateLimiter(5, 3600, limiter_clock)
         self.user_limiter = RateLimiter(login_max_failures, login_lock_seconds, limiter_clock)
         self.ip_limiter = RateLimiter(login_max_failures * 6, login_lock_seconds, limiter_clock)
         self.register_limiter = RateLimiter(10, 3600, limiter_clock)
@@ -119,6 +165,15 @@ class AccountStore:
                 token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(user_id),
                 csrf_token TEXT NOT NULL, created_at REAL NOT NULL, last_seen REAL NOT NULL,
                 expires_at REAL NOT NULL, ip TEXT NOT NULL DEFAULT '', revoked INTEGER NOT NULL DEFAULT 0)""")
+            ensure_columns(self.db, "users", {"email": "TEXT", "email_key": "TEXT", "email_verified": "INTEGER NOT NULL DEFAULT 0",
+                                              "totp_secret": "TEXT", "totp_enabled": "INTEGER NOT NULL DEFAULT 0",
+                                              "totp_last_step": "INTEGER NOT NULL DEFAULT 0",
+                                              "pin_hash": "TEXT", "pin_set_at": "REAL"})
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_verified_email ON users(email_key) WHERE email_verified = 1")
+            self.db.execute("DROP TABLE IF EXISTS recovery_codes")          # recovery codes were removed; email reset replaces them
+            self.db.execute("""CREATE TABLE IF NOT EXISTS email_codes (
+                code_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, purpose TEXT NOT NULL, email_key TEXT NOT NULL,
+                code_hash TEXT NOT NULL, expires_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0)""")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, revoked, created_at)")
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, event TEXT NOT NULL,
@@ -132,7 +187,7 @@ class AccountStore:
     # ---- audit ------------------------------------------------------------
 
     def audit(self, user_id: str | None, event: str, ip: str = "", **detail: Any) -> None:
-        text = json.dumps(detail, sort_keys=True, default=str)[:2000]
+        text = json.dumps({**self.audit_context(), **detail}, sort_keys=True, default=str)[:2000]
         with self.ledger.lock:
             self.db.execute("INSERT INTO audit_events(user_id, event, ip, detail_json, created_at) VALUES (?, ?, ?, ?, ?)",
                             (user_id, event, ip[:64], text, self.clock()))
@@ -148,22 +203,26 @@ class AccountStore:
 
     # ---- registration and login -------------------------------------------
 
-    def register(self, username: Any, password: Any, ip: str = "") -> dict[str, str]:
+    def register(self, username: Any, password: Any, ip: str = "", email: Any = None) -> dict[str, str]:
         self.register_limiter.check_and_hit(f"ip:{ip}")
         validate_username(username)
         validate_password(password, username)
+        email = validate_email(email) if email not in (None, "") else None
         user_id = "u_" + secrets.token_hex(16)
         encoded = hash_password(password, self.iterations)
         try:
             with self.ledger.transaction():
-                self.db.execute("INSERT INTO users(user_id, username, username_key, password_hash, created_at) "
-                                "VALUES (?, ?, ?, ?, ?)", (user_id, username, username.casefold(), encoded, self.clock()))
+                self.db.execute("INSERT INTO users(user_id, username, username_key, password_hash, created_at, email, email_key) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, username, username.casefold(), encoded, self.clock(),
+                                                                 email, email.casefold() if email else None))
         except sqlite3.IntegrityError:
             raise ConflictError("username is already taken") from None
         self.audit(user_id, "register", ip)
+        if email:
+            self.send_email_code(user_id, "verify", ip)
         return {"user_id": user_id, "username": username}
 
-    def login(self, username: Any, password: Any, ip: str = "") -> dict[str, Any]:
+    def login(self, username: Any, password: Any, ip: str = "", otp: Any = None) -> dict[str, Any]:
         text = username.casefold()[:64] if isinstance(username, str) else ""
         user_key, ip_key = f"u:{text}", f"ip:{ip}"
         retry = max(self.user_limiter.blocked_for(user_key), self.ip_limiter.blocked_for(ip_key))
@@ -178,6 +237,14 @@ class AccountStore:
             self.ip_limiter.hit(ip_key)
             self.audit(row["user_id"] if row else None, "login_failed", ip)
             raise AuthError("invalid username or password")
+        if row["totp_enabled"]:
+            if otp in (None, ""):
+                raise OtpRequired("verification code required")
+            if not self._consume_totp(row["user_id"], otp):
+                self.user_limiter.hit(user_key)
+                self.ip_limiter.hit(ip_key)
+                self.audit(row["user_id"], "login_failed", ip, reason="verification_code")
+                raise AuthError("invalid username, password or verification code")
         self.user_limiter.reset(user_key)
         if iterations < self.iterations:     # upgrade an older hash now that we hold the password
             with self.ledger.transaction():
@@ -202,6 +269,263 @@ class AccountStore:
                 "(SELECT token_hash FROM sessions WHERE user_id = ? AND revoked = 0 ORDER BY created_at DESC LIMIT ?)",
                 (user_id, user_id, self.max_sessions))
         return {"token": token, "csrf_token": csrf, "expires_at": now + self.session_ttl}
+
+    # ---- authenticator app (optional, login only) -----------------------------------
+
+    def _consume_totp(self, user_id: str, code: Any) -> bool:
+        """Accept an authenticator code once per 30-second step."""
+        if not isinstance(code, str):
+            return False
+        code = code.replace(" ", "")
+        with self.ledger.transaction():
+            row = self.db.execute("SELECT totp_secret, totp_enabled, totp_last_step FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None or not row["totp_enabled"]:
+                return False
+            step = totp.verify(row["totp_secret"], code, self.clock(), row["totp_last_step"])
+            if step is None:
+                return False
+            self.db.execute("UPDATE users SET totp_last_step = ? WHERE user_id = ?", (step, user_id))
+            return True
+
+    def totp_status(self, user_id: str) -> dict[str, Any]:
+        with self.ledger.lock:
+            row = self.db.execute("SELECT totp_enabled FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return {"enabled": bool(row and row["totp_enabled"])}
+
+    def totp_begin(self, user_id: str) -> dict[str, str]:
+        secret = totp.generate_secret()
+        with self.ledger.transaction():
+            row = self.db.execute("SELECT username, totp_enabled FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None:
+                raise AuthError("unknown user")
+            if row["totp_enabled"]:
+                raise ConflictError("the authenticator app is already enabled")
+            self.db.execute("UPDATE users SET totp_secret = ?, totp_last_step = 0 WHERE user_id = ?", (secret, user_id))
+        return {"secret": secret, "otpauth_uri": totp.otpauth_uri(secret, row["username"], self.issuer)}
+
+    def totp_confirm(self, user_id: str, code: Any, ip: str = "") -> None:
+        """Turn the authenticator on after the user proves their app works."""
+        key = f"otp:{user_id}"
+        retry = self.user_limiter.blocked_for(key)
+        if retry > 0:
+            raise RateLimited(retry)
+        with self.ledger.transaction():
+            row = self.db.execute("SELECT totp_secret, totp_enabled FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None or not row["totp_secret"] or row["totp_enabled"]:
+                raise ConflictError("start authenticator setup first")
+            step = totp.verify(row["totp_secret"], code if isinstance(code, str) else "", self.clock())
+            if step is None:
+                self.user_limiter.hit(key)
+                raise AuthError("that code is not valid; check your authenticator app's clock")
+            self.db.execute("UPDATE users SET totp_enabled = 1, totp_last_step = 0 WHERE user_id = ?", (user_id,))
+        self.user_limiter.reset(key)
+        self.audit(user_id, "totp_enabled", ip)
+
+    def totp_disable(self, user_id: str, password: Any, code: Any, ip: str = "") -> None:
+        """Turn the authenticator off (password and a current code). If the device is lost, a password reset by
+        email turns it off instead."""
+        with self.ledger.lock:
+            row = self.db.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        key = f"pw:{user_id}"
+        retry = self.user_limiter.blocked_for(key)
+        if retry > 0:
+            raise RateLimited(retry)
+        if row is None or not isinstance(password, str) or not verify_password(password[:1024], row["password_hash"])[0]:
+            self.user_limiter.hit(key)
+            raise AuthError("password is incorrect")
+        if not self._consume_totp(user_id, code):
+            self.user_limiter.hit(key)
+            raise AuthError("invalid verification code")
+        with self.ledger.transaction():
+            self.db.execute("UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_last_step = 0 WHERE user_id = ?", (user_id,))
+        self.audit(user_id, "totp_disabled", ip)
+
+    # ---- transaction PIN -------------------------------------------------------------
+
+    def _encode_pin(self, pin: str) -> str:
+        salt = os.urandom(16)
+        digest = hashlib.pbkdf2_hmac("sha256", pin.encode(), salt + self.pin_pepper, self.iterations)
+        return f"pin1${self.iterations}${_b64(salt)}${_b64(digest)}"
+
+    def _pin_matches(self, pin: str, encoded: str) -> bool:
+        try:
+            _, iterations, salt_b64, digest_b64 = encoded.split("$")
+            iterations = int(iterations)
+            if not 1 <= iterations <= MAX_HASH_ITERATIONS:
+                return False
+            salt, expected = base64.b64decode(salt_b64), base64.b64decode(digest_b64)
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", pin.encode(), salt + self.pin_pepper, iterations), expected)
+
+    def pin_status(self, user_id: str) -> dict[str, Any]:
+        with self.ledger.lock:
+            row = self.db.execute("SELECT pin_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return {"set": bool(row and row["pin_hash"])}
+
+    def _check_password(self, user_id: str, password: Any) -> None:
+        key = f"pw:{user_id}"
+        retry = self.user_limiter.blocked_for(key)
+        if retry > 0:
+            raise RateLimited(retry)
+        with self.ledger.lock:
+            row = self.db.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or not isinstance(password, str) or not verify_password(password[:1024], row["password_hash"])[0]:
+            self.user_limiter.hit(key)
+            raise AuthError("password is incorrect")
+        self.user_limiter.reset(key)
+
+    def _store_pin(self, user_id: str, pin: str) -> None:
+        encoded = self._encode_pin(pin)
+        with self.ledger.transaction():
+            self.db.execute("UPDATE users SET pin_hash = ?, pin_set_at = ? WHERE user_id = ?", (encoded, self.clock(), user_id))
+
+    def set_pin(self, user_id: str, password: Any, pin: Any, ip: str = "") -> None:
+        """First-time PIN. Needs the account password so a hijacked session cannot choose the PIN."""
+        validate_pin(pin)
+        self._check_password(user_id, password)
+        if self.pin_status(user_id)["set"]:
+            raise ConflictError("a PIN is already set; change it, or reset it by email if you forgot it")
+        self._store_pin(user_id, pin)
+        self.audit(user_id, "pin_set", ip)
+
+    def change_pin(self, user_id: str, current_pin: Any, new_pin: Any, ip: str = "") -> None:
+        validate_pin(new_pin)
+        self.verify_pin(user_id, current_pin, ip)
+        if new_pin == current_pin:
+            raise ValidationError("the new PIN must differ from the current one")
+        self._store_pin(user_id, new_pin)
+        self.audit(user_id, "pin_changed", ip)
+
+    def verify_pin(self, user_id: str, pin: Any, ip: str = "") -> None:
+        """Authorise one transaction. Five wrong PINs lock PIN use for 15 minutes."""
+        with self.ledger.lock:
+            row = self.db.execute("SELECT pin_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or not row["pin_hash"]:
+            raise PinNotSet("set your transaction PIN first")
+        key = f"pin:{user_id}"
+        retry = self.user_limiter.blocked_for(key)
+        if retry > 0:
+            raise RateLimited(retry)
+        if pin in (None, ""):
+            raise PinRequired("enter your transaction PIN")
+        if not isinstance(pin, str) or not PIN_PATTERN.fullmatch(pin) or not self._pin_matches(pin, row["pin_hash"]):
+            self.user_limiter.hit(key)
+            self.audit(user_id, "pin_failed", ip)
+            raise InvalidPin("incorrect PIN")
+        self.user_limiter.reset(key)
+
+    def request_pin_reset(self, user_id: str, ip: str = "") -> None:
+        """Email a code that lets the customer choose a new PIN (needs a verified email)."""
+        status = self.security_status(user_id)
+        if not status["email_verified"]:
+            raise ValidationError("verify your email first; it is how a forgotten PIN is reset")
+        self.send_email_code(user_id, "pin", ip)
+
+    def reset_pin(self, user_id: str, code: Any, password: Any, new_pin: Any, ip: str = "") -> None:
+        validate_pin(new_pin)
+        self._check_password(user_id, password)
+        if not self._check_code(user_id, "pin", code):
+            raise AuthError("invalid or expired code")
+        self._store_pin(user_id, new_pin)
+        self.user_limiter.reset(f"pin:{user_id}")
+        self.audit(user_id, "pin_reset", ip)
+
+    # ---- email verification and password reset ----------------------------------
+
+    def security_status(self, user_id: str) -> dict[str, Any]:
+        with self.ledger.lock:
+            row = self.db.execute("SELECT email, email_verified FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return {"email": row["email"] if row else None, "email_verified": bool(row and row["email_verified"]),
+                "totp": self.totp_status(user_id), "pin": self.pin_status(user_id)}
+
+    @staticmethod
+    def _hash_code(code: str, user_id: str, purpose: str) -> str:
+        return hashlib.sha256(f"{purpose}:{user_id}:{code}".encode()).hexdigest()
+
+    def send_email_code(self, user_id: str, purpose: str, ip: str = "") -> None:
+        with self.ledger.lock:
+            row = self.db.execute("SELECT email, email_key FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or not row["email"]:
+            raise ValidationError("add an email address first")
+        self.mail_limiter.check_and_hit(f"mail:{row['email_key']}")
+        code = f"{secrets.randbelow(10 ** 8):08d}"
+        with self.ledger.transaction():
+            self.db.execute("UPDATE email_codes SET used = 1 WHERE user_id = ? AND purpose = ? AND used = 0", (user_id, purpose))
+            self.db.execute("INSERT INTO email_codes(user_id, purpose, email_key, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)",
+                            (user_id, purpose, row["email_key"], self._hash_code(code, user_id, purpose), self.clock() + CODE_TTL))
+        subject = {"verify": "Your verification code", "reset": "Your password reset code", "pin": "Your PIN reset code"}[purpose]
+        self.mailer.send(row["email"], subject, f"Your code is {code}. It expires in {CODE_TTL // 60} minutes. "
+                                                 "If you did not ask for it, ignore this message and do not share the code.")
+        self.audit(user_id, f"email_code_sent", ip, purpose=purpose)
+
+    def set_email(self, user_id: str, email: Any, ip: str = "") -> None:
+        email = validate_email(email)
+        with self.ledger.transaction():
+            self.db.execute("UPDATE users SET email = ?, email_key = ?, email_verified = 0 WHERE user_id = ?",
+                            (email, email.casefold(), user_id))
+        self.audit(user_id, "email_changed", ip)
+        self.send_email_code(user_id, "verify", ip)
+
+    def _check_code(self, user_id: str, purpose: str, code: Any) -> bool:
+        """Validate (and consume) the latest unexpired code; wrong guesses burn attempts."""
+        if not isinstance(code, str) or not re.fullmatch(r"\d{8}", code.strip()):
+            return False
+        with self.ledger.transaction():
+            row = self.db.execute("SELECT * FROM email_codes WHERE user_id = ? AND purpose = ? AND used = 0 "
+                                  "ORDER BY code_id DESC LIMIT 1", (user_id, purpose)).fetchone()
+            if row is None or row["expires_at"] < self.clock() or row["attempts"] >= MAX_CODE_ATTEMPTS:
+                return False
+            if not hmac.compare_digest(row["code_hash"], self._hash_code(code.strip(), user_id, purpose)):
+                self.db.execute("UPDATE email_codes SET attempts = attempts + 1 WHERE code_id = ?", (row["code_id"],))
+                return False
+            self.db.execute("UPDATE email_codes SET used = 1 WHERE code_id = ?", (row["code_id"],))
+            return True
+
+    def verify_email(self, user_id: str, code: Any, ip: str = "") -> None:
+        if not self._check_code(user_id, "verify", code):
+            raise AuthError("invalid or expired code")
+        try:
+            with self.ledger.transaction():
+                self.db.execute("UPDATE users SET email_verified = 1 WHERE user_id = ?", (user_id,))
+        except sqlite3.IntegrityError:
+            raise ConflictError("that email is already verified on another account") from None
+        self.audit(user_id, "email_verified", ip)
+
+    def request_password_reset(self, email: Any, ip: str = "") -> None:
+        """Always returns quietly so the response never reveals whether an account exists."""
+        key = email.strip().casefold() if isinstance(email, str) else ""
+        retry = self.register_limiter.blocked_for(f"reset-ip:{ip}")
+        if retry > 0:
+            raise RateLimited(retry)
+        self.register_limiter.hit(f"reset-ip:{ip}")
+        with self.ledger.lock:
+            row = self.db.execute("SELECT user_id FROM users WHERE email_key = ? AND email_verified = 1", (key,)).fetchone() if key else None
+        if row is not None:
+            try:
+                self.send_email_code(row["user_id"], "reset", ip)
+            except RateLimited:
+                pass
+
+    def reset_password(self, email: Any, code: Any, new_password: Any, ip: str = "") -> None:
+        key = email.strip().casefold() if isinstance(email, str) else ""
+        limit_key = f"reset:{key}"
+        retry = self.user_limiter.blocked_for(limit_key)
+        if retry > 0:
+            raise RateLimited(retry)
+        with self.ledger.lock:
+            row = self.db.execute("SELECT user_id, username FROM users WHERE email_key = ? AND email_verified = 1", (key,)).fetchone() if key else None
+        if row is None or not self._check_code(row["user_id"], "reset", code):
+            self.user_limiter.hit(limit_key)
+            raise AuthError("invalid or expired code")
+        validate_password(new_password, row["username"])
+        encoded = hash_password(new_password, self.iterations)
+        with self.ledger.transaction():
+            self.db.execute("UPDATE users SET password_hash = ?, totp_enabled = 0, totp_secret = NULL, totp_last_step = 0 "
+                            "WHERE user_id = ?", (encoded, row["user_id"]))
+            self.db.execute("UPDATE sessions SET revoked = 1 WHERE user_id = ?", (row["user_id"],))
+        self.user_limiter.reset(limit_key)
+        self.audit(row["user_id"], "password_reset", ip)
 
     # ---- sessions ---------------------------------------------------------
 

@@ -69,6 +69,9 @@ class PoolSnapshot:
     correlation: float | None = None        # return correlation of the two tokens, if known
     audited: bool | None = None
     age_days: int | None = None
+    price0_usd: float | None = None         # current USD price of token0 / token1 (None when unknown)
+    price1_usd: float | None = None
+    token_addresses: tuple[str, ...] = ()   # contract addresses of the two tokens, when the source gives them
     as_of: float = 0.0                      # unix seconds
     source: str = "unknown"
 
@@ -89,6 +92,11 @@ class PoolSnapshot:
         if self.correlation is not None and (not _finite(self.correlation) or not -1 <= self.correlation <= 1):
             raise ValueError("correlation must be in [-1, 1]")
         object.__setattr__(self, "price_history", tuple(self.price_history))
+        object.__setattr__(self, "token_addresses", tuple(self.token_addresses))
+        for name in ("price0_usd", "price1_usd"):
+            value = getattr(self, name)
+            if value is not None and (not _finite(value) or value <= 0):
+                raise ValueError(f"{name} must be a positive number")
         if any(not _finite(p) or p <= 0 for p in self.price_history):
             raise ValueError("price_history must contain positive numbers")
         if not _finite(self.as_of) or self.as_of < 0:
@@ -145,7 +153,7 @@ def with_price_history(snapshot: PoolSnapshot, prices: Iterable[float]) -> PoolS
 
 _FIELDS = ("pool_id", "chain", "dex", "token0", "token1", "tvl_usd", "fee_tier_bps", "volume_usd_1d",
            "volume_usd_7d", "price_history", "reported_fee_apr", "correlation", "audited", "age_days",
-           "as_of", "source")
+           "price0_usd", "price1_usd", "token_addresses", "as_of", "source")
 
 
 def load_snapshots(path: str | Path) -> tuple[list[PoolSnapshot], dict[str, Any]]:
@@ -199,7 +207,10 @@ def parse_defillama_pools(payload: dict[str, Any], as_of: float, min_tvl_usd: fl
         if not pool_id or len(tokens) != 2 or not _finite(tvl) or tvl <= 0 or tvl < min_tvl_usd:
             continue
         fee_match = _FEE_TIER.search(str(row.get("poolMeta") or ""))
-        apy_base = row.get("apyBase")
+        apy_candidates = [v for v in (row.get("apyBase"), row.get("apyBase7d")) if _finite(v) and v >= 0]
+        apy_base = min(apy_candidates) if apy_candidates else None          # the lower of the 1-day and 7-day base APY
+        addresses = row.get("underlyingTokens")
+        addresses = tuple(a for a in addresses if isinstance(a, str)) if isinstance(addresses, list) else ()
         try:
             snapshots.append(PoolSnapshot(
                 pool_id=str(pool_id), chain=str(row.get("chain", "")).lower() or "unknown",
@@ -208,7 +219,8 @@ def parse_defillama_pools(payload: dict[str, Any], as_of: float, min_tvl_usd: fl
                 fee_tier_bps=float(fee_match.group(1)) * 100 if fee_match else None,
                 volume_usd_1d=row.get("volumeUsd1d") if _finite(row.get("volumeUsd1d")) else None,
                 volume_usd_7d=row.get("volumeUsd7d") if _finite(row.get("volumeUsd7d")) else None,
-                reported_fee_apr=apy_base / 100.0 if _finite(apy_base) and apy_base >= 0 else None,
+                reported_fee_apr=apy_base / 100.0 if apy_base is not None else None,
+                token_addresses=addresses if len(addresses) == 2 else (),
                 as_of=as_of, source="defillama"))
         except ValueError:
             continue

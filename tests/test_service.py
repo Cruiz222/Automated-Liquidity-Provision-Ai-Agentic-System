@@ -11,7 +11,7 @@ from app.service import NotFound, PlatformService, SimulationDisabled
 from pathlib import Path
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "pools_snapshot.json"
-BANK = {"bank_code": "058", "account_number": "0123456789"}
+BANK = {"bank_code": "058", "account_number": "0123456785"}
 USDC_POOL = "usdc-usdt-arbitrum-1bp"
 ETH_POOL = "weth-usdc-arbitrum-5bp"
 
@@ -40,7 +40,7 @@ class ServiceCase(unittest.TestCase):
     def make(self, **settings):
         self.clock = Clock()
         self.provider = MutableProvider(self.clock)
-        defaults = dict(database=":memory:", password_iterations=1000, pool_refresh_seconds=0)
+        defaults = dict(database=":memory:", password_iterations=1000, pool_refresh_seconds=0, require_pin=False)
         self.service = PlatformService(Settings(**{**defaults, **settings}), clock=self.clock, pool_provider=self.provider)
         self.addCleanup(self.service.close)
         return self.service
@@ -48,8 +48,84 @@ class ServiceCase(unittest.TestCase):
     def user(self, name="alice"):
         return self.service.accounts.register(name, "correct-horse-battery", ip=name)["user_id"]
 
+    _bvn = iter(range(10 ** 10, 10 ** 10 + 1000))
+
+    def verify(self, user):
+        self.service.kyc_basic(user, "Test Customer", str(next(self._bvn)))
+
     def fund(self, user, usdt_micro=3_000_000_000):
         self.service.deposit(user, "USDT", usdt_micro, f"fund-{user}-{usdt_micro}")
+
+
+class TestPinEnforcement(ServiceCase):
+    PIN = "482915"
+
+    def setUp(self):
+        self.make(require_pin=True)
+        self.u = self.user()
+
+    def pinned(self):
+        self.service.accounts.set_pin(self.u, "correct-horse-battery", self.PIN)
+
+    def test_nothing_moves_before_a_pin_exists(self):
+        from app.accounts import PinNotSet
+        with self.assertRaises(PinNotSet):
+            self.service.deposit(self.u, "USDT", 1_000_000, "dep-key-0001", pin=self.PIN)
+        self.assertEqual(self.service.wallet(self.u)["balances"]["USDT"], 0)
+
+    def test_every_money_action_checks_the_pin(self):
+        from app.accounts import InvalidPin, PinRequired
+        self.pinned()
+        self.service.deposit(self.u, "USDT", 2_000_000_000, "dep-key-0001", pin=self.PIN)
+        self.service.deposit(self.u, "NGN", 100_000_000, "dep-key-0002", pin=self.PIN)
+        quote = self.service.create_quote(self.u, "NGN", 15_000_000)
+        pos = self.service.open_position(self.u, USDC_POOL, 500_000_000, "open-pos-001", pin=self.PIN)
+        calls = {
+            "deposit": lambda pin, k: self.service.deposit(self.u, "USDT", 1_000_000, k, pin=pin),
+            "convert": lambda pin, k: self.service.execute_quote(self.u, quote["quote_id"], k, pin=pin),
+            "open": lambda pin, k: self.service.open_position(self.u, USDC_POOL, 500_000_000, k, pin=pin),
+            "deploy": lambda pin, k: self.service.deploy_recommendation(self.u, 600_000_000, k, pin=pin),
+            "close": lambda pin, k: self.service.close_position(self.u, pos["position_id"], k, pin=pin),
+            "withdraw": lambda pin, k: self.service.request_withdrawal(self.u, "NGN", 4_000_000, {"account_number": "0123456785"}, k, pin=pin),
+            "payout add": lambda pin, k: self.service.add_payout_account(self.u, "NGN", "Mine", {"account_number": "0123456785"}, pin=pin),
+        }
+        for name, call in calls.items():
+            with self.assertRaises(PinRequired, msg=name):
+                call(None, f"nopin-key-{name.replace(' ', '')}")
+            with self.assertRaises(InvalidPin, msg=name):
+                call("000000", f"badpin-key-{name.replace(' ', '')}")
+            self.service.accounts.user_limiter.reset(f"pin:{self.u}")              # the lockout is tested separately
+        self.assertEqual(self.service.wallet(self.u)["balances"]["USDT"], 2_000_000_000 - 500_000_000)    # nothing leaked through
+        self.assertEqual(len(self.service.positions.list_positions(self.u)), 1)
+
+    def test_replays_do_not_need_the_pin_again(self):
+        self.pinned()
+        first = self.service.deposit(self.u, "USDT", 1_000_000, "dep-key-0001", pin=self.PIN)
+        self.assertEqual(self.service.deposit(self.u, "USDT", 1_000_000, "dep-key-0001"), first)
+        self.service.deposit(self.u, "USDT", 2_000_000_000, "dep-key-0002", pin=self.PIN)
+        opened = self.service.deploy_recommendation(self.u, 2_000_000_000, "deploy-key-01", pin=self.PIN)
+        again = self.service.deploy_recommendation(self.u, 2_000_000_000, "deploy-key-01")
+        self.assertEqual([p["position_id"] for p in opened], [p["position_id"] for p in again])
+
+    def test_cancelling_a_withdrawal_and_reading_data_need_no_pin(self):
+        self.pinned()
+        self.service.deposit(self.u, "NGN", 100_000_000, "dep-key-0001", pin=self.PIN)
+        w = self.service.request_withdrawal(self.u, "NGN", 4_000_000, {"account_number": "0123456785"}, "wd-key-0001", pin=self.PIN)
+        self.service.cancel_withdrawal(self.u, w["withdrawal_id"])
+        self.service.wallet(self.u), self.service.pools(), self.service.list_positions(self.u)
+
+
+class TestMailerSelection(unittest.TestCase):
+    def test_console_by_default_and_smtp_when_configured(self):
+        from app.accounts import ConsoleMailer, SmtpMailer
+        plain = PlatformService(Settings(database=":memory:", password_iterations=1000))
+        self.addCleanup(plain.close)
+        self.assertIsInstance(plain.accounts.mailer, ConsoleMailer)
+        smtp = PlatformService(Settings(database=":memory:", password_iterations=1000, smtp_host="smtp.example.com", smtp_from="no-reply@example.com"))
+        self.addCleanup(smtp.close)
+        self.assertIsInstance(smtp.accounts.mailer, SmtpMailer)
+        with self.assertRaises(ValueError):
+            Settings(smtp_host="smtp.example.com")                       # a sender address is required
 
 
 class TestWalletAndValuation(ServiceCase):
@@ -114,6 +190,7 @@ class TestWithdrawalsAndQuotes(ServiceCase):
     def test_withdrawal_lifecycle_and_ownership(self):
         service = self.make()
         a, b = self.user("alice"), self.user("bobby")
+        self.verify(a)
         service.deposit(a, "NGN", 100_000_000, "ngn-dep-001")
         w = service.request_withdrawal(a, "NGN", 10_000_000, BANK, "wd-key-0001")
         wid = w["withdrawal_id"]
@@ -133,6 +210,7 @@ class TestWithdrawalsAndQuotes(ServiceCase):
     def test_cancel_returns_funds(self):
         service = self.make()
         a = self.user()
+        self.verify(a)
         service.deposit(a, "NGN", 100_000_000, "ngn-dep-001")
         w = service.request_withdrawal(a, "NGN", 10_000_000, BANK, "wd-key-0001")
         service.cancel_withdrawal(a, w["withdrawal_id"])
@@ -260,7 +338,7 @@ class TestPositions(ServiceCase):
         self.assertLessEqual(later["value_minor"], 2 * 500_000_000)
         self.assertGreaterEqual(later["fees_minor"], first["fees_minor"])
 
-    def test_price_move_creates_impermanent_loss(self):
+    def test_price_halving_values_position_at_sqrt_of_ratio(self):
         service = self.make()
         u = self.user()
         self.fund(u)
@@ -270,7 +348,7 @@ class TestPositions(ServiceCase):
         self.provider.overrides[ETH_POOL] = crash
         self.clock.now += 40
         position = service.list_positions(u)[0]
-        self.assertAlmostEqual((position["value_minor"] - position["fees_minor"]) / 200_000_000, 1 - 0.0572, places=3)
+        self.assertAlmostEqual((position["value_minor"] - position["fees_minor"]) / 200_000_000, 0.5 ** 0.5, places=3)
 
     def test_close_pays_out_and_reconciles(self):
         service = self.make()

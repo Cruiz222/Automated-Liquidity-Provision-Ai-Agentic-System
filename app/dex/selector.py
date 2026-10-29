@@ -62,6 +62,7 @@ class SelectorConfig:
     min_position_usd: float = 50.0
     depeg_max_haircut_apr: float = 0.02
     default_gas_usd: float = 3.0
+    concentrated_fee_haircut: float = 0.5   # pool-wide fee APR overstates a full-range LP in v3-style pools
     gas_usd: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_GAS_USD))
     category_limits: dict[PoolCategory, CategoryLimits] = field(
         default_factory=lambda: dict(DEFAULT_CATEGORY_LIMITS))
@@ -90,6 +91,8 @@ class PoolEvaluation:
     tokens: tuple[str, str] = ("", "")
     tvl_usd: float = 0.0
     latest_price: float | None = None
+    price0_usd: float | None = None
+    price1_usd: float | None = None
     daily_volume_usd: float | None = None
     volatility: float | None = None
     fee_apr: float = 0.0
@@ -175,7 +178,7 @@ class PoolSelector:
         warnings: list[str] = []
         evaluation = PoolEvaluation(pool_id=pool.pool_id, category=category, eligible=False, chain=pool.chain,
                                     tokens=(pool.token0, pool.token1), tvl_usd=pool.tvl_usd,
-                                    latest_price=pool.latest_price)
+                                    latest_price=pool.latest_price, price0_usd=pool.price0_usd, price1_usd=pool.price1_usd)
 
         age_hours = (now - pool.as_of) / 3600.0
         if age_hours > cfg.max_snapshot_age_hours:
@@ -188,7 +191,10 @@ class PoolSelector:
         volume = pool.daily_volume_usd()
         evaluation.daily_volume_usd = volume
         if volume is None:
-            reasons.append("no volume data")
+            if pool.reported_fee_apr is None:
+                reasons.append("no volume data")
+            else:
+                warnings.append("volume unknown; relying on the source's fee APR")
         elif volume < cfg.min_daily_volume_usd:
             reasons.append(f"daily volume ${volume:,.0f} below minimum ${cfg.min_daily_volume_usd:,.0f}")
 
@@ -202,6 +208,10 @@ class PoolSelector:
         elif len(fee_estimates) == 2 and min(fee_estimates) > 0 and max(fee_estimates) / min(fee_estimates) > 3:
             warnings.append("modelled and reported fee APR differ by more than 3x; using the lower")
         fee_apr = min(fee_estimates) if fee_estimates else 0.0
+        dex = pool.dex.lower()
+        if fee_apr and cfg.concentrated_fee_haircut < 1 and ("v3" in dex or "slipstream" in dex):
+            fee_apr *= cfg.concentrated_fee_haircut
+            warnings.append(f"concentrated-liquidity pool: fee APR cut by {1 - cfg.concentrated_fee_haircut:.0%} for a full-range position")
 
         vol = self._volatility(pool, category, reasons, warnings)
         evaluation.volatility = vol
@@ -332,7 +342,8 @@ class PoolSelector:
         details = {
             pool_id: {
                 "category": by_id[pool_id].category.value, "chain": by_id[pool_id].chain,
-                "tokens": list(by_id[pool_id].tokens), "net_apr": by_id[pool_id].net_apr, "entry_price": by_id[pool_id].latest_price,
+                "tokens": list(by_id[pool_id].tokens), "net_apr": by_id[pool_id].net_apr, "entry_price": by_id[pool_id].latest_price, "price0_usd": by_id[pool_id].price0_usd,
+                "price1_usd": by_id[pool_id].price1_usd,
                 "net_apr_after_gas": by_id[pool_id].net_apr - gas_drag.get(pool_id, 0.0),
                 "risk_score": by_id[pool_id].risk_score,
                 "share_of_pool_tvl": amount / MICRO / by_id[pool_id].tvl_usd,

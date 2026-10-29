@@ -11,7 +11,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from ..dex.selector import CapitalAllocation
-from ..fx import ConversionQuotes, RateQuote, RateService
+from ..fx import ConversionQuotes, RateError, RateQuote, RateService
 from ..ledger import InsufficientFunds, WalletLedger
 from .positions import LiquidityPositions
 
@@ -38,7 +38,8 @@ class PortfolioManager:
             token0, token1 = allocation.details.get(pool_id, {}).get("tokens", ["", ""])
             results.append(self.positions.open_position(
                 account, pool_id, token0 or "?", token1 or "?", amount, f"{idempotency_prefix}:{pool_id}",
-                entry_price=allocation.details.get(pool_id, {}).get("entry_price")))
+                entry_price=allocation.details.get(pool_id, {}).get("entry_price"),
+                entry_prices=(allocation.details.get(pool_id, {}).get("price0_usd"), allocation.details.get(pool_id, {}).get("price1_usd"))))
         return results
 
     def _rate(self, rate: RateQuote | None) -> RateQuote:
@@ -50,7 +51,10 @@ class PortfolioManager:
         return RateQuote(fixed, fixed, time.time(), "static")
 
     def valuation(self, account: str, rate: RateQuote | None = None) -> dict[str, Any]:
-        rate = self._rate(rate)
+        try:
+            rate = self._rate(rate)
+        except RateError:
+            rate = None          # no trustworthy rate: report USDT-side values only and say so
         balances = self.ledger.balances(account)
         pending = {"NGN": 0, "USDT": 0}
         for withdrawal in self.ledger.list_withdrawals(account):
@@ -58,6 +62,8 @@ class PortfolioManager:
                 pending[withdrawal["currency"]] += withdrawal["amount_minor"] + withdrawal["fee_minor"]
 
         def ngn_to_usdt(kobo: int) -> int:
+            if rate is None:
+                return 0
             return int((Decimal(kobo) / Decimal(100) / rate.ask * MICRO).to_integral_value(rounding=ROUND_DOWN))
 
         positions = self.positions.list_positions(account)
@@ -77,8 +83,10 @@ class PortfolioManager:
             "unrealized_pnl_usdt_micro": position_value - principal,
             "realized_pnl_usdt_micro": realized,
             "total_value_usdt_micro": total_usdt,
-            "total_value_ngn_kobo": int((Decimal(total_usdt) / MICRO * rate.bid * 100).to_integral_value(rounding=ROUND_DOWN)),
-            "rate": {"bid": str(rate.bid), "ask": str(rate.ask), "source": rate.source, "as_of": rate.as_of},
+            "total_value_ngn_kobo": (int((Decimal(total_usdt) / MICRO * rate.bid * 100).to_integral_value(rounding=ROUND_DOWN))
+                                     if rate else None),
+            "total_excludes_ngn": rate is None,
+            "rate": ({"bid": str(rate.bid), "ask": str(rate.ask), "source": rate.source, "as_of": rate.as_of} if rate else None),
             "positions": [{
                 "position_id": p["position_id"], "pool_id": p["pool_id"], "pair": f"{p['asset']}/{p['quote_asset']}",
                 "status": p["status"], "principal_usdt_micro": p["principal_minor"],
