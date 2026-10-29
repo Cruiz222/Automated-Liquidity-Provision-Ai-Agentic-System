@@ -264,6 +264,66 @@ class TestPools(ServiceCase):
         with self.assertRaises(InvalidOperation):
             service.open_position(u, USDC_POOL, 500_000_000, "open-pos-001")
 
+    def test_recommendation_report_is_auditable_and_does_not_move_funds(self):
+        service = self.make()
+        user = self.user()
+        self.fund(user)
+
+        balances_before = service.ledger.balances(user)
+        positions_before = service.positions.list_positions(user)
+
+        with service.ledger.lock:
+            entries_before = service.ledger.db.execute(
+                "SELECT COUNT(*) FROM ledger_entries"
+            ).fetchone()[0]
+
+        report = service.recommendation(3_000_000_000)
+
+        balances_after = service.ledger.balances(user)
+        positions_after = service.positions.list_positions(user)
+
+        with service.ledger.lock:
+            entries_after = service.ledger.db.execute(
+                "SELECT COUNT(*) FROM ledger_entries"
+            ).fetchone()[0]
+
+        self.assertEqual(balances_after, balances_before)
+        self.assertEqual(positions_after, positions_before)
+        self.assertEqual(entries_after, entries_before)
+
+        self.assertEqual(report["report_type"], "dex_pool_screening")
+        self.assertEqual(report["total_capital_minor"], 3_000_000_000)
+        self.assertEqual(
+            report["allocated_minor"]
+            + report["reserve_minor"]
+            + report["unallocated_minor"],
+            report["total_capital_minor"],
+        )
+
+        self.assertFalse(report["execution"]["performed"])
+        self.assertFalse(report["execution"]["funds_moved"])
+        self.assertFalse(report["execution"]["positions_changed"])
+
+        self.assertTrue(report["pool_evaluations"])
+        self.assertTrue(
+            any(not pool["eligible"] for pool in report["pool_evaluations"])
+        )
+
+        selected_ids = {
+            item["pool_id"] for item in report["allocations"]
+        }
+        for item in report["allocations"]:
+            self.assertIn("fee_apr", item)
+            self.assertIn("il_apr", item)
+            self.assertIn("net_apr_after_gas", item)
+            self.assertIn("source", item)
+
+        for pool in report["pool_evaluations"]:
+            if pool["pool_id"] in selected_ids:
+                self.assertGreater(pool["selected_amount_minor"], 0)
+            else:
+                self.assertEqual(pool["selected_amount_minor"], 0)
+
     def test_recommendation_and_scenario(self):
         service = self.make()
         rec = service.recommendation(3_000_000_000)

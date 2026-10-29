@@ -583,6 +583,126 @@ class PlatformService:
         return out
 
     def recommendation(self, amount_minor: Any) -> dict[str, Any]:
+        """Build an auditable DEX screening report without moving funds or changing positions.
+
+        Pool snapshots may be refreshed and persisted by _selector().
+        """
+        amount = self._amount(amount_minor)
+        selector, by_id = self._selector()
+
+        try:
+            result = selector.select(amount, now=self.clock())
+        except PoolSelectionError as error:
+            raise InvalidOperation(str(error)) from None
+
+        evaluations = {evaluation.pool_id: evaluation for evaluation in result.evaluations}
+        allocation = result.allocation
+
+        items = []
+        for pool_id, amount_minor in sorted(
+            allocation.allocations.items(),
+            key=lambda item: -item[1],
+        ):
+            evaluation = evaluations[pool_id]
+            snapshot = by_id[pool_id]
+            details = allocation.details[pool_id]
+
+            items.append({
+                "pool_id": pool_id,
+                "amount_minor": amount_minor,
+                "tokens": list(evaluation.tokens),
+                "chain": evaluation.chain,
+                "category": evaluation.category.value,
+                "net_apr": evaluation.net_apr,
+                "fee_apr": evaluation.fee_apr,
+                "il_apr": evaluation.il_apr,
+                "depeg_haircut_apr": evaluation.depeg_haircut_apr,
+                "risk_score": evaluation.risk_score,
+                "net_apr_after_gas": details["net_apr_after_gas"],
+                "tvl_usd": evaluation.tvl_usd,
+                "daily_volume_usd": evaluation.daily_volume_usd,
+                "share_of_pool_tvl": details["share_of_pool_tvl"],
+                "snapshot_as_of": snapshot.as_of,
+                "source": snapshot.source,
+                "dex": snapshot.dex,
+                "warnings": list(evaluation.warnings),
+            })
+
+        pool_evaluations = []
+        for evaluation in result.evaluations:
+            snapshot = by_id[evaluation.pool_id]
+            row = evaluation.to_dict()
+            row.update({
+                "snapshot_as_of": snapshot.as_of,
+                "source": snapshot.source,
+                "dex": snapshot.dex,
+                "fee_tier_bps": snapshot.fee_tier_bps,
+                "latest_price": snapshot.latest_price,
+                "reported_fee_apr": snapshot.reported_fee_apr,
+                "selected_amount_minor": allocation.allocations.get(
+                    evaluation.pool_id, 0
+                ),
+                "excluded_reasons": list(
+                    result.excluded.get(evaluation.pool_id, [])
+                ),
+            })
+            pool_evaluations.append(row)
+
+        cfg = selector.config
+        allocated = allocation.allocated_minor
+
+        return {
+            # Existing response fields retained for API compatibility.
+            "allocations": items,
+            "reserve_minor": allocation.reserve_minor,
+            "unallocated_minor": allocation.unallocated_minor,
+            "excluded": result.excluded,
+            "rationale": allocation.rationale,
+            "disclaimer": (
+                "Research screening only. Estimates are not guaranteed returns "
+                "or investment advice. No funds are moved and no positions "
+                "are opened or marked by this report."
+            ),
+
+            # Additional audit fields.
+            "report_type": "dex_pool_screening",
+            "total_capital_minor": allocation.total_capital_minor,
+            "allocated_minor": allocated,
+            "pool_evaluations": pool_evaluations,
+            "data_status": dict(self.data_status),
+            "assumptions": {
+                "currency": "USDT",
+                "amount_unit": "micro-USDT (1 USDT = 1,000,000 units)",
+                "horizon_days": cfg.horizon_days,
+                "reserve_fraction": cfg.reserve_fraction,
+                "max_snapshot_age_hours": cfg.max_snapshot_age_hours,
+                "min_tvl_usd": cfg.min_tvl_usd,
+                "min_daily_volume_usd": cfg.min_daily_volume_usd,
+                "min_history_points": cfg.min_history_points,
+                "max_pool_weight": cfg.max_pool_weight,
+                "max_pool_tvl_share": cfg.max_pool_tvl_share,
+                "model_scope": (
+                    "Full-range constant-product-style exposure; "
+                    "concentrated-liquidity range management is not modelled."
+                ),
+                "data_limitations": (
+                    "Results depend on snapshot quality and model assumptions. "
+                    "Estimated fee APR and impermanent loss are not forecasts."
+                ),
+            },
+            "execution": {
+                "performed": False,
+                "funds_moved": False,
+                "positions_changed": False,
+                "note": (
+                    "This endpoint screens and allocates hypothetically. "
+                    "Separate deployment operations are required to open "
+                    "paper positions."
+                ),
+            },
+        }
+
+    def scenario(self, pool_id: Any, price_change_pct: float, days: int = 30, amount_usdt: float = 1000.0) -> dict[str, Any]:
         amount = self._amount(amount_minor)
         selector, _ = self._selector()
         try:
