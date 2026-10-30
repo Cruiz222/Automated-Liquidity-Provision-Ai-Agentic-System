@@ -5,9 +5,19 @@ from .market_data import (
     HistoricalMarketDataLoader,
     PricePoint,
 )
+from .portfolio import (
+    LPPortfolioResult,
+    PortfolioModelError,
+    PortfolioPoint,
+    V2LPPortfolioModel,
+)
 
 __all__ = [
     "HistoricalMarketData",
     "HistoricalMarketDataLoader",
     "PricePoint",
+    "LPPortfolioResult",
+    "PortfolioModelError",
+    "PortfolioPoint",
+    "V2LPPortfolioModel",
 ]
