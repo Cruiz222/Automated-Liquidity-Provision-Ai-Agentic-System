@@ -19,6 +19,12 @@ from .accounting import (
     NetPortfolioResult,
 )
 
+from .splitting import (
+    ChronologicalMarketDataSplitter,
+    DataSplitError,
+    HistoricalMarketDataSplit,
+)
+
 __all__ = [
     "HistoricalMarketData",
     "HistoricalMarketDataLoader",
@@ -32,4 +38,7 @@ __all__ = [
     "LPAccountingModel",
     "NetPortfolioPoint",
     "NetPortfolioResult",
+    "ChronologicalMarketDataSplitter",
+    "DataSplitError",
+    "HistoricalMarketDataSplit",
 ]
