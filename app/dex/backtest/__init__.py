@@ -11,6 +11,13 @@ from .portfolio import (
     PortfolioPoint,
     V2LPPortfolioModel,
 )
+from .accounting import (
+    AccountingModelError,
+    ExecutionCostConfig,
+    LPAccountingModel,
+    NetPortfolioPoint,
+    NetPortfolioResult,
+)
 
 __all__ = [
     "HistoricalMarketData",
@@ -20,4 +27,9 @@ __all__ = [
     "PortfolioModelError",
     "PortfolioPoint",
     "V2LPPortfolioModel",
+    "AccountingModelError",
+    "ExecutionCostConfig",
+    "LPAccountingModel",
+    "NetPortfolioPoint",
+    "NetPortfolioResult",
 ]
