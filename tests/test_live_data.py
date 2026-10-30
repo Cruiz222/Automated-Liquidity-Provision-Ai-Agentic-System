@@ -100,6 +100,10 @@ class TestDefiLlamaProvider(unittest.TestCase):
         self.assertEqual(len(eth.price_history), 30)                            # the one-hour offset between series is tolerated
         self.assertAlmostEqual(eth.price_history[0], 3000.0)
         self.assertAlmostEqual(eth.price_history[1], 3000.0 * 1.01 / 1.01)
+        self.assertEqual(len(eth.price_observations), 30)
+        self.assertEqual(eth.price_observations[0][0], NOW - 30 * 86400)
+        self.assertEqual(eth.price_observations[1][0] - eth.price_observations[0][0], 86400)
+        self.assertAlmostEqual(eth.price_observations[0][1], eth.price_history[0])
 
     def test_low_confidence_prices_are_not_used(self):
         pools = self.provider(low_confidence={"arbitrum:" + WETH}).fetch_pools()

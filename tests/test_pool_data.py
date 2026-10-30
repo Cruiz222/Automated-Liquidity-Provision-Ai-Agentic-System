@@ -38,6 +38,10 @@ class TestValidation(unittest.TestCase):
     def test_bad_values_rejected(self):
         for overrides in ({"tvl_usd": 0}, {"tvl_usd": float("nan")}, {"fee_tier_bps": 10_000},
                           {"volume_usd_1d": -1}, {"correlation": 2}, {"price_history": (1.0, -1.0)},
+                          {"price_observations": ((1.0, 2.0), (1.0, 3.0))},
+                          {"price_observations": ((-1.0, 2.0),)},
+                          {"price_observations": ((1.0, 0.0),)},
+                          {"price_observations": ((1.0,),)},
                           {"pool_id": ""}, {"token0": " "}, {"as_of": -5}):
             with self.assertRaises(ValueError, msg=str(overrides)):
                 pool(**overrides)
@@ -90,6 +94,15 @@ class TestDefiLlama(unittest.TestCase):
     def test_attach_price_history(self):
         snap = parse_defillama_pools(self.PAYLOAD, as_of=1.0)[0]
         self.assertEqual(with_price_history(snap, [1, 2, 3]).price_history, (1, 2, 3))
+
+    def test_timestamped_observations_round_trip(self):
+        snap = pool(price_history=(2.0, 3.0), price_observations=((100.0, 2.0), (200.0, 3.0)))
+        restored = PoolSnapshot.from_dict(snap.to_dict())
+        self.assertEqual(restored, snap)
+
+    def test_timestamped_observations_load_from_json_lists(self):
+        snap = pool(price_observations=[[100.0, 2.0], [200.0, 3.0]])
+        self.assertEqual(snap.price_observations, ((100.0, 2.0), (200.0, 3.0)))
 
 
 if __name__ == "__main__":

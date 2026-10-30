@@ -120,15 +120,34 @@ class DefiLlamaPoolProvider:
         return charts
 
     @staticmethod
-    def _ratio_series(first: list[tuple[float, float]], second: list[tuple[float, float]], tolerance: float = 12 * 3600) -> list[float]:
-        """Daily token0/token1 price: pair each point of the first series with the nearest second-series point."""
+    def _ratio_observations(
+        first: list[tuple[float, float]],
+        second: list[tuple[float, float]],
+        tolerance: float = 12 * 3600,
+    ) -> list[tuple[float, float]]:
+        """Return timestamped token0/token1 ratios using the nearest token1 observation."""
         out, j = [], 0
+        if not first or not second:
+            return out
+
         for ts, price in first:
             while j + 1 < len(second) and abs(second[j + 1][0] - ts) <= abs(second[j][0] - ts):
                 j += 1
             if abs(second[j][0] - ts) <= tolerance:
-                out.append(price / second[j][1])
+                out.append((ts, price / second[j][1]))
         return out
+
+    @staticmethod
+    def _ratio_series(
+        first: list[tuple[float, float]],
+        second: list[tuple[float, float]],
+        tolerance: float = 12 * 3600,
+    ) -> list[float]:
+        """Legacy price-only view of the timestamp-aligned token ratio series."""
+        return [
+            price
+            for _, price in DefiLlamaPoolProvider._ratio_observations(first, second, tolerance)
+        ]
 
     # ---- main entry ------------------------------------------------------------------
     def fetch_pools(self) -> list[PoolSnapshot]:
@@ -146,12 +165,17 @@ class DefiLlamaPoolProvider:
         for snapshot in snapshots:
             pair = self._coin_ids(snapshot)
             p0, p1 = (prices.get(pair[0].lower()), prices.get(pair[1].lower())) if pair else (None, None)
-            history: list[float] = []
+            observations: list[tuple[float, float]] = []
             if pair and pair[0].lower() in charts and pair[1].lower() in charts:
-                history = self._ratio_series(charts[pair[0].lower()], charts[pair[1].lower()])
+                observations = self._ratio_observations(
+                    charts[pair[0].lower()],
+                    charts[pair[1].lower()],
+                )
+            history = tuple(price for _, price in observations)
             priced += bool(p0 and p1)
             with_history += len(history) >= 14
-            out.append(replace(snapshot, price0_usd=p0, price1_usd=p1, price_history=tuple(history),
+            out.append(replace(snapshot, price0_usd=p0, price1_usd=p1, price_history=history,
+                               price_observations=tuple(observations),
                                source="defillama (yields.llama.fi, coins.llama.fi)"))
         seen = Counter(r.get("project") for r in rows if isinstance(r, dict) and str(r.get("chain", "")).lower() in self.universe.chains)
         self.last_report = {"rows": len(rows), "after_filter": len(chosen), "snapshots": len(out), "with_usd_prices": priced,

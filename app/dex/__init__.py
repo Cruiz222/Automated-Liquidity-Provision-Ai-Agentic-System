@@ -1,4 +1,5 @@
 """DEX pool data, impermanent-loss and AMM math, and pool selection."""
+from .collector import CollectionResult, PoolSnapshotCollector
 from .amm import AMMModelError, evaluate_constant_product_position, impermanent_loss_fraction
 from .il import annualized_volatility, expected_v2_il, v2_il, v3_capital_multiplier, v3_holdings, v3_il
 from .pool_data import (
@@ -12,6 +13,7 @@ from .selector import (
 from .snapshot_store import SnapshotStore
 
 __all__ = [
+    "CollectionResult", "PoolSnapshotCollector",
     "AMMModelError", "CapitalAllocation", "CategoryLimits", "FixturePoolProvider", "PoolCategory",
     "PoolDataProvider", "PoolEvaluation", "PoolSelectionError", "PoolSelector", "PoolSnapshot",
     "SelectionResult", "SelectorConfig", "SnapshotStore", "annualized_volatility",

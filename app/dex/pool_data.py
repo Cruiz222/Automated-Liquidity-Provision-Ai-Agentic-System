@@ -65,6 +65,8 @@ class PoolSnapshot:
     volume_usd_1d: float | None = None
     volume_usd_7d: float | None = None
     price_history: tuple[float, ...] = ()   # daily token0/token1 closes, oldest first
+    price_observations: tuple[tuple[float, float], ...] = ()
+    # (unix timestamp, token0/token1 price), oldest first
     reported_fee_apr: float | None = None   # fraction (0.05 = 5%), from the data source
     correlation: float | None = None        # return correlation of the two tokens, if known
     audited: bool | None = None
@@ -92,6 +94,14 @@ class PoolSnapshot:
         if self.correlation is not None and (not _finite(self.correlation) or not -1 <= self.correlation <= 1):
             raise ValueError("correlation must be in [-1, 1]")
         object.__setattr__(self, "price_history", tuple(self.price_history))
+
+        observations = []
+        for point in self.price_observations:
+            if not isinstance(point, (tuple, list)) or len(point) != 2:
+                raise ValueError("each price_observations entry must be (timestamp, price)")
+            observations.append((point[0], point[1]))
+
+        object.__setattr__(self, "price_observations", tuple(observations))
         object.__setattr__(self, "token_addresses", tuple(self.token_addresses))
         for name in ("price0_usd", "price1_usd"):
             value = getattr(self, name)
@@ -99,6 +109,17 @@ class PoolSnapshot:
                 raise ValueError(f"{name} must be a positive number")
         if any(not _finite(p) or p <= 0 for p in self.price_history):
             raise ValueError("price_history must contain positive numbers")
+
+        previous_timestamp = -1.0
+        for timestamp, price in self.price_observations:
+            if not _finite(timestamp) or timestamp < 0:
+                raise ValueError("price observation timestamps must be non-negative numbers")
+            if not _finite(price) or price <= 0:
+                raise ValueError("price observation prices must be positive numbers")
+            if timestamp <= previous_timestamp:
+                raise ValueError("price observation timestamps must be strictly increasing")
+            previous_timestamp = timestamp
+
         if not _finite(self.as_of) or self.as_of < 0:
             raise ValueError("as_of must be a non-negative unix timestamp")
 
@@ -125,6 +146,7 @@ class PoolSnapshot:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["price_history"] = list(self.price_history)
+        data["price_observations"] = [list(point) for point in self.price_observations]
         return data
 
     @classmethod
@@ -152,7 +174,7 @@ def with_price_history(snapshot: PoolSnapshot, prices: Iterable[float]) -> PoolS
 
 
 _FIELDS = ("pool_id", "chain", "dex", "token0", "token1", "tvl_usd", "fee_tier_bps", "volume_usd_1d",
-           "volume_usd_7d", "price_history", "reported_fee_apr", "correlation", "audited", "age_days",
+           "volume_usd_7d", "price_history", "price_observations", "reported_fee_apr", "correlation", "audited", "age_days",
            "price0_usd", "price1_usd", "token_addresses", "as_of", "source")
 
 
