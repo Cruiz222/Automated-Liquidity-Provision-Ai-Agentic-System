@@ -159,6 +159,92 @@ class TestSnapshotStore(unittest.TestCase):
             6,
         )
 
+    def test_latest_all_as_of_returns_latest_eligible_snapshot_per_pool(self):
+        first = dataclasses.replace(
+            self.base,
+            as_of=100,
+            tvl_usd=10_000_000,
+        )
+        second = dataclasses.replace(
+            self.base,
+            as_of=200,
+            tvl_usd=20_000_000,
+        )
+        future = dataclasses.replace(
+            self.base,
+            as_of=300,
+            tvl_usd=30_000_000,
+        )
+
+        for snapshot in (first, second, future):
+            self.store.save(snapshot)
+
+        result = self.store.latest_all_as_of(250)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].as_of, 200)
+        self.assertEqual(result[0].tvl_usd, 20_000_000)
+
+    def test_latest_all_as_of_excludes_pools_without_eligible_snapshots(self):
+        first_pool = dataclasses.replace(
+            self.base,
+            as_of=100,
+        )
+        second_pool = dataclasses.replace(
+            self.base,
+            pool_id="another-pool",
+            as_of=300,
+        )
+
+        self.store.save(first_pool)
+        self.store.save(second_pool)
+
+        result = self.store.latest_all_as_of(200)
+
+        self.assertEqual(
+            [snapshot.pool_id for snapshot in result],
+            [first_pool.pool_id],
+        )
+
+    def test_latest_all_as_of_uses_latest_inserted_snapshot_on_timestamp_tie(self):
+        first_source = dataclasses.replace(
+            self.base,
+            as_of=100,
+            source="source-a",
+            tvl_usd=10_000_000,
+        )
+        second_source = dataclasses.replace(
+            self.base,
+            as_of=100,
+            source="source-b",
+            tvl_usd=20_000_000,
+        )
+
+        self.store.save(first_source)
+        self.store.save(second_source)
+
+        result = self.store.latest_all_as_of(100)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].source, "source-b")
+        self.assertEqual(result[0].tvl_usd, 20_000_000)
+
+    def test_latest_all_as_of_returns_empty_when_no_snapshots_qualify(self):
+        self.store.save(
+            dataclasses.replace(self.base, as_of=200)
+        )
+
+        self.assertEqual(
+            self.store.latest_all_as_of(100),
+            [],
+        )
+
+    def test_latest_all_as_of_rejects_invalid_cutoffs(self):
+        for cutoff in (-1, float("nan"), float("inf"), True, "100"):
+            with self.subTest(cutoff=cutoff):
+                with self.assertRaises(ValueError):
+                    self.store.latest_all_as_of(cutoff)
+
 
 class TestFixtureProvider(unittest.TestCase):
     def test_restamping_keeps_synthetic_label_and_never_looks_stale(self):

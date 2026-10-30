@@ -177,6 +177,52 @@ class SnapshotStore:
             for row in rows
         ]
 
+    def latest_all_as_of(
+        self,
+        cutoff_timestamp: float,
+    ) -> list[PoolSnapshot]:
+        """Return each pool's latest snapshot recorded at or before cutoff.
+
+        If multiple sources recorded a snapshot at the same timestamp,
+        the most recently inserted record wins.
+
+        Pools without an eligible snapshot are excluded.
+        Results are ordered by pool_id.
+        """
+        if (
+            isinstance(cutoff_timestamp, bool)
+            or not isinstance(cutoff_timestamp, (int, float))
+            or not math.isfinite(cutoff_timestamp)
+            or cutoff_timestamp < 0
+        ):
+            raise ValueError(
+                "cutoff_timestamp must be a non-negative finite timestamp"
+            )
+
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT snapshot.payload_json
+                FROM pool_snapshots AS snapshot
+                WHERE snapshot.snapshot_id = (
+                    SELECT candidate.snapshot_id
+                    FROM pool_snapshots AS candidate
+                    WHERE candidate.pool_id = snapshot.pool_id
+                      AND candidate.as_of <= ?
+                    ORDER BY candidate.as_of DESC,
+                             candidate.snapshot_id DESC
+                    LIMIT 1
+                )
+                ORDER BY snapshot.pool_id
+                """,
+                (cutoff_timestamp,),
+            ).fetchall()
+
+        return [
+            PoolSnapshot.from_dict(json.loads(row[0]))
+            for row in rows
+        ]
+
     def history(
         self,
         pool_id: str,
