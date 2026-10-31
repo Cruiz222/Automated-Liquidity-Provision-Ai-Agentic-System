@@ -25,6 +25,13 @@ from .splitting import (
     HistoricalMarketDataSplit,
 )
 
+from .oos import (
+    DEXOutOfSampleEvaluator,
+    OOSBacktestError,
+    OOSBacktestResult,
+    OOSPoolResult,
+)
+
 __all__ = [
     "HistoricalMarketData",
     "HistoricalMarketDataLoader",
@@ -41,4 +48,8 @@ __all__ = [
     "ChronologicalMarketDataSplitter",
     "DataSplitError",
     "HistoricalMarketDataSplit",
+    "DEXOutOfSampleEvaluator",
+    "OOSBacktestError",
+    "OOSBacktestResult",
+    "OOSPoolResult",
 ]
