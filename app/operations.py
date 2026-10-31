@@ -96,8 +96,24 @@ def snapshot(data_dir='data', registry_path=DEFAULT_REGISTRY, active=None, clock
                       'artifact_path': latest_capture['report_path']}
     return {'report_version': 1, 'data_dir': str(root), 'active': active_summary,
             'latest_capture': latest_capture, 'latest_workflow': latest_workflow,
-            'recent_experiments': [{'id': r['id'], 'status': r['status'], 'created_at': r['created_at'],
-                                    'instrument': r['manifest']['instrument']} for r in runs],
+            "recent_experiments": [
+                {
+                    "id": run["id"],
+                    "status": run["status"],
+                    "created_at": run["created_at"],
+                    "study_type": run.get("study_type", "trading"),
+                    "instrument": (
+                        run["manifest"].get("instrument")
+                        or run["manifest"].get("study_name")
+                        or (
+                            "DEX LP"
+                            if run.get("study_type") == "dex_lp"
+                            else "Unknown"
+                        )
+                    ),
+                }
+                for run in runs
+            ],
             'saved_capture_count': len(captures), 'saved_workflow_count': len(workflows),
             'next_action': action, 'warnings': warnings,
             'limitations': ['Saved reports are not revalidated here; run capture review or the workflow before using their data.',
