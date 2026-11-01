@@ -60,7 +60,9 @@ class PoolUniverse:
         if (
             self.history_alignment_tolerance_seconds is not None
             and (
-                not math.isfinite(self.history_alignment_tolerance_seconds)
+                isinstance(self.history_alignment_tolerance_seconds, bool)
+                or not isinstance(self.history_alignment_tolerance_seconds, (int, float))
+                or not math.isfinite(self.history_alignment_tolerance_seconds)
                 or self.history_alignment_tolerance_seconds <= 0
             )
         ):
