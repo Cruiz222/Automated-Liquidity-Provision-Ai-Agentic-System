@@ -87,7 +87,7 @@ def make_fetch(pools=None, low_confidence=(), fail_prices=False, fail_charts=Fal
                         prices[i],
                         points=span,
                         start=NOW - span * interval,
-                        jitter=3600.0 if i.endswith(USDC) else 0.0,
+                        jitter=3600.0 if period == "1d" and i.endswith(USDC) else 0.0,
                         interval=interval,
                     )
                     for i in ids if i in prices
