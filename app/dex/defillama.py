@@ -67,7 +67,9 @@ class PoolUniverse:
 
     @property
     def effective_history_span(self) -> int:
-        return self.history_points if self.history_points is not None else self.history_days
+        if self.history_points is not None:
+            return self.history_points
+        return self.history_days * 24 if self.history_period == "1h" else self.history_days
 
     @property
     def effective_alignment_tolerance_seconds(self) -> float:
