@@ -65,12 +65,13 @@ class TestImpermanentLoss(unittest.TestCase):
 
     def test_timestamped_volatility_is_resolution_independent(self):
         hourly_returns = [0.002, -0.001, 0.003, -0.002] * 12
-        daily_returns = [sum(hourly_returns[i:i + 24]) for i in range(0, 0, 24)]
-        # Use the same constant variance rate with a deterministic alternating
-        # path: daily increments are 24 hourly increments aggregated in blocks.
+        # Construct daily observations with the same realized quadratic
+        # variation per elapsed second as the hourly path. These are separate
+        # sampling paths: daily closes cannot retain intraday round trips.
         daily_returns = [
-            0.01 * math.sqrt(24) * (-1) ** i
-            for i in range(4)
+            math.sqrt(sum(value * value for value in hourly_returns[i:i + 24]))
+            * (-1) ** (i // 24)
+            for i in range(0, len(hourly_returns), 24)
         ]
         hourly_prices = [100.0]
         for value in hourly_returns:
