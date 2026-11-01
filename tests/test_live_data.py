@@ -142,6 +142,9 @@ class TestDefiLlamaProvider(unittest.TestCase):
             if pool.pool_id == "id-eth-usdc"
         )
         self.assertEqual(len(eth.price_observations), 48)
+        self.assertEqual(provider.last_report["history_observations_min"], 48)
+        self.assertEqual(provider.last_report["history_interval_seconds_median"], 3600)
+        self.assertAlmostEqual(provider.last_report["history_coverage_hours_min"], 47)
         self.assertEqual(
             eth.price_observations[1][0] - eth.price_observations[0][0],
             3600,
@@ -192,6 +195,9 @@ class TestDefiLlamaProvider(unittest.TestCase):
         report = provider.last_report
         self.assertEqual((report["rows"], report["after_filter"], report["snapshots"], report["with_usd_prices"]), (11, 2, 2, 2))
         self.assertEqual(report["with_price_history"], 2)
+        self.assertEqual(report["history_observations_min"], 30)
+        self.assertEqual(report["history_interval_seconds_median"], 86400)
+        self.assertAlmostEqual(report["history_coverage_hours_min"], 29 * 24)
         self.assertIn("uniswap-v3", report["projects_on_chosen_chains"])
 
     def test_many_coins_are_requested_in_small_batches(self):
