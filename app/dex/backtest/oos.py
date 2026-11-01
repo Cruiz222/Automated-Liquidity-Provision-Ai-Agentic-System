@@ -276,13 +276,19 @@ class DEXOutOfSampleEvaluator:
                 ]
                 continue
 
-            # Rebuild selector history from timestamped training data.
-            # Never use un-timestamped snapshot price_history here.
+            # Rebuild selector history exclusively from timestamped
+            # training observations. Preserve timestamps so the selector
+            # can estimate volatility using actual elapsed time. Never pass
+            # testing observations or substitute snapshot collection times.
+            training_observations = tuple(
+                (point.timestamp, point.price)
+                for point in split.training.observations
+            )
             training_prices = tuple(
                 point.price for point in split.training.observations
             )
 
-            if not training_prices:
+            if not training_observations:
                 exclusions[pool_id] = [
                     "no training price observations at cutoff"
                 ]
@@ -292,6 +298,7 @@ class DEXOutOfSampleEvaluator:
                 **{
                     **snapshot.to_dict(),
                     "price_history": training_prices,
+                    "price_observations": training_observations,
                 }
             )
 
