@@ -78,9 +78,19 @@ class SelectorConfig:
             raise ValueError("horizon_days must be positive")
         if self.min_history_points < 3:
             raise ValueError("min_history_points must be at least 3")
-        if not math.isfinite(self.min_history_days) or self.min_history_days <= 0:
+        if (
+            isinstance(self.min_history_days, bool)
+            or not isinstance(self.min_history_days, (int, float))
+            or not math.isfinite(self.min_history_days)
+            or self.min_history_days <= 0
+        ):
             raise ValueError("min_history_days must be positive and finite")
-        if not math.isfinite(self.max_history_gap_hours) or self.max_history_gap_hours <= 0:
+        if (
+            isinstance(self.max_history_gap_hours, bool)
+            or not isinstance(self.max_history_gap_hours, (int, float))
+            or not math.isfinite(self.max_history_gap_hours)
+            or self.max_history_gap_hours <= 0
+        ):
             raise ValueError("max_history_gap_hours must be positive and finite")
         if not 0 <= self.reserve_fraction < 1:
             raise ValueError("reserve_fraction must be in [0, 1)")
