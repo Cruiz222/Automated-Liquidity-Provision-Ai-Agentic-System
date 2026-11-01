@@ -23,7 +23,7 @@ from .pool_data import PoolSnapshot, parse_defillama_pools
 
 POOLS_URL = "https://yields.llama.fi/pools"
 CURRENT_URL = "https://coins.llama.fi/prices/current/{coins}"
-CHART_URL = "https://coins.llama.fi/chart/{coins}?span={span}&period=1d"
+CHART_URL = "https://coins.llama.fi/chart/{coins}?span={span}&period={period}"
 
 # DefiLlama chain names -> the prefix its coins API expects.
 CHAIN_PREFIX = {"ethereum": "ethereum", "arbitrum": "arbitrum", "base": "base", "polygon": "polygon",
@@ -45,6 +45,35 @@ class PoolUniverse:
     min_tvl_usd: float = 5_000_000.0
     max_pools: int = 40
     history_days: int = 30
+    history_period: str = "1d"
+    history_points: int | None = None
+    history_alignment_tolerance_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.history_days < 1:
+            raise ValueError("history_days must be at least 1")
+        if self.history_period not in {"1d", "1h"}:
+            raise ValueError("history_period must be '1d' or '1h'")
+        if self.history_points is not None and self.history_points < 3:
+            raise ValueError("history_points must be at least 3")
+        if (
+            self.history_alignment_tolerance_seconds is not None
+            and (
+                not math.isfinite(self.history_alignment_tolerance_seconds)
+                or self.history_alignment_tolerance_seconds <= 0
+            )
+        ):
+            raise ValueError("history alignment tolerance must be positive and finite")
+
+    @property
+    def effective_history_span(self) -> int:
+        return self.history_points if self.history_points is not None else self.history_days
+
+    @property
+    def effective_alignment_tolerance_seconds(self) -> float:
+        if self.history_alignment_tolerance_seconds is not None:
+            return self.history_alignment_tolerance_seconds
+        return 12.0 * 3600.0 if self.history_period == "1d" else 15.0 * 60.0
 
 
 def _symbols(row: dict[str, Any]) -> list[str]:
@@ -107,7 +136,13 @@ class DefiLlamaPoolProvider:
         charts: dict[str, list[tuple[float, float]]] = {}
         for batch in self._batches(ids):
             try:
-                coins = self._fetch(CHART_URL.format(coins=batch, span=self.universe.history_days)).get("coins", {})
+                coins = self._fetch(
+                    CHART_URL.format(
+                        coins=batch,
+                        span=self.universe.effective_history_span,
+                        period=self.universe.history_period,
+                    )
+                ).get("coins", {})
             except (ProviderError, AttributeError):
                 continue
             for coin, record in coins.items():
@@ -125,16 +160,23 @@ class DefiLlamaPoolProvider:
         second: list[tuple[float, float]],
         tolerance: float = 12 * 3600,
     ) -> list[tuple[float, float]]:
-        """Return timestamped token0/token1 ratios using the nearest token1 observation."""
-        out, j = [], 0
+        """Align token charts one-to-one; never reuse a token1 observation."""
+        out: list[tuple[float, float]] = []
         if not first or not second:
             return out
 
+        j = 0
         for ts, price in first:
-            while j + 1 < len(second) and abs(second[j + 1][0] - ts) <= abs(second[j][0] - ts):
+            if j >= len(second):
+                break
+            while (
+                j + 1 < len(second)
+                and abs(second[j + 1][0] - ts) < abs(second[j][0] - ts)
+            ):
                 j += 1
             if abs(second[j][0] - ts) <= tolerance:
                 out.append((ts, price / second[j][1]))
+                j += 1
         return out
 
     @staticmethod
@@ -170,6 +212,7 @@ class DefiLlamaPoolProvider:
                 observations = self._ratio_observations(
                     charts[pair[0].lower()],
                     charts[pair[1].lower()],
+                    tolerance=self.universe.effective_alignment_tolerance_seconds,
                 )
             history = tuple(price for _, price in observations)
             priced += bool(p0 and p1)
@@ -178,6 +221,15 @@ class DefiLlamaPoolProvider:
                                price_observations=tuple(observations),
                                source="defillama (yields.llama.fi, coins.llama.fi)"))
         seen = Counter(r.get("project") for r in rows if isinstance(r, dict) and str(r.get("chain", "")).lower() in self.universe.chains)
-        self.last_report = {"rows": len(rows), "after_filter": len(chosen), "snapshots": len(out), "with_usd_prices": priced,
-                            "with_price_history": with_history, "projects_on_chosen_chains": dict(seen.most_common(15))}
+        self.last_report = {
+            "rows": len(rows),
+            "after_filter": len(chosen),
+            "snapshots": len(out),
+            "with_usd_prices": priced,
+            "with_price_history": with_history,
+            "history_period": self.universe.history_period,
+            "history_span": self.universe.effective_history_span,
+            "history_alignment_tolerance_seconds": self.universe.effective_alignment_tolerance_seconds,
+            "projects_on_chosen_chains": dict(seen.most_common(15)),
+        }
         return out
