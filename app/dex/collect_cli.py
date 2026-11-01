@@ -59,7 +59,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-tvl", type=float, default=5_000_000.0)
     parser.add_argument("--max-pools", type=int, default=40)
-    parser.add_argument("--history-days", type=int, default=30)
+    parser.add_argument(
+        "--history-days",
+        type=int,
+        default=30,
+        help="Legacy daily chart span; retained for backward compatibility.",
+    )
+    parser.add_argument(
+        "--history-period",
+        choices=("1d", "1h"),
+        default="1d",
+        help="DefiLlama chart resolution (default: 1d).",
+    )
+    parser.add_argument(
+        "--history-points",
+        type=int,
+        default=None,
+        help="Explicit chart span in observations; for example 720 with --history-period 1h.",
+    )
 
     parser.add_argument(
         "--watch",
@@ -104,6 +121,8 @@ def build_provider(args: argparse.Namespace) -> Any:
         min_tvl_usd=args.min_tvl,
         max_pools=args.max_pools,
         history_days=args.history_days,
+        history_period=args.history_period,
+        history_points=args.history_points,
     )
     return DefiLlamaPoolProvider(universe)
 
@@ -139,6 +158,12 @@ def main() -> int:
         parser.error("--max-pools must be at least 1.")
     if args.history_days < 1:
         parser.error("--history-days must be at least 1.")
+    if args.history_points is not None and args.history_points < 3:
+        parser.error("--history-points must be at least 3.")
+    if args.history_period == "1h" and args.history_points is None:
+        parser.error("--history-points is required with --history-period 1h.")
+    if args.history_period == "1d" and args.history_points is not None:
+        parser.error("--history-points is only supported with --history-period 1h.")
     if args.keep_per_pool < 1:
         parser.error("--keep-per-pool must be at least 1.")
 
@@ -171,6 +196,14 @@ def main() -> int:
 
         print(f"Mode: {args.mode}", flush=True)
         print(f"Research database: {database_path}", flush=True)
+        if args.mode == "live":
+            universe = provider.universe
+            print(
+                f"Price history: period={universe.history_period}, "
+                f"span={universe.effective_history_span} observations, "
+                f"alignment_tolerance={universe.effective_alignment_tolerance_seconds}s",
+                flush=True,
+            )
         print(
             "Data warning: fixture mode contains synthetic observations."
             if args.mode == "fixture"
