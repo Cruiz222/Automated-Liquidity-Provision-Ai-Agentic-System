@@ -33,6 +33,35 @@ python3 -m unittest discover -s tests -t .      # tests
 Verification and reset codes are printed to the server console and `data/outbox.log` unless SMTP is configured.
 Other settings are in `docs/DEPLOYMENT.md`.
 
+## DEX historical research data
+
+Collect daily history (the default) into a dedicated SQLite database:
+
+```bash
+python3 -m app.dex.collect_cli --mode live \
+  --database data/dex_snapshots_daily.sqlite3 \
+  --history-period 1d --history-days 30
+```
+
+Collect approximately 30 days of hourly chart observations separately:
+
+```bash
+python3 -m app.dex.collect_cli --mode live \
+  --database data/dex_snapshots_hourly.sqlite3 \
+  --history-period 1h --history-points 720
+```
+
+Timestamped price observations are authoritative for volatility and stablecoin
+depeg analysis. The estimator uses realized log-return quadratic variation per
+unit of elapsed time and rejects gaps longer than the selector's configured
+48-hour maximum. It also requires at least 14 days of timestamped coverage by
+default. Older snapshots without timestamps retain the legacy daily-close
+volatility fallback.
+
+These observations are historical reference prices, not executable quotes.
+OOS results remain modelled simulations; constant fee-APR assumptions are not
+realized historical LP fee income.
+
 ## Security basics for customers
 
 * A **transaction PIN** (6 digits) must be set before any transaction and is entered to confirm each one.
