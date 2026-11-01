@@ -1,7 +1,7 @@
 """Live pool data from DefiLlama's public APIs (read-only, no key).
 
 * ``https://yields.llama.fi/pools``: pool list with TVL, base (fee) APY, volumes, token addresses, fee tier.
-* ``https://coins.llama.fi/prices/current/{coins}`` and ``/chart/{coins}``: USD prices and daily price history,
+* ``https://coins.llama.fi/prices/current/{coins}`` and ``/chart/{coins}``: USD prices and configurable daily/hourly price history,
   with coins addressed as ``chain:0xaddress``.
 
 Response shapes follow DefiLlama's published API documentation. The parsers are tolerant (rows that do not fit are
