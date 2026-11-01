@@ -12,6 +12,7 @@ no USD price and, if volatile, no price history, so the selector excludes it ins
 from __future__ import annotations
 
 import math
+import statistics
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -223,6 +224,16 @@ class DefiLlamaPoolProvider:
                                price_observations=tuple(observations),
                                source="defillama (yields.llama.fi, coins.llama.fi)"))
         seen = Counter(r.get("project") for r in rows if isinstance(r, dict) and str(r.get("chain", "")).lower() in self.universe.chains)
+        history_counts = [len(pool.price_observations) for pool in out if pool.price_observations]
+        history_coverage_hours = [
+            (pool.price_observations[-1][0] - pool.price_observations[0][0]) / 3600.0
+            for pool in out if len(pool.price_observations) >= 2
+        ]
+        history_intervals = [
+            right[0] - left[0]
+            for pool in out
+            for left, right in zip(pool.price_observations, pool.price_observations[1:])
+        ]
         self.last_report = {
             "rows": len(rows),
             "after_filter": len(chosen),
@@ -232,6 +243,12 @@ class DefiLlamaPoolProvider:
             "history_period": self.universe.history_period,
             "history_span": self.universe.effective_history_span,
             "history_alignment_tolerance_seconds": self.universe.effective_alignment_tolerance_seconds,
+            "history_observations_min": min(history_counts) if history_counts else 0,
+            "history_observations_median": statistics.median(history_counts) if history_counts else 0,
+            "history_observations_max": max(history_counts) if history_counts else 0,
+            "history_coverage_hours_min": min(history_coverage_hours) if history_coverage_hours else 0.0,
+            "history_coverage_hours_median": statistics.median(history_coverage_hours) if history_coverage_hours else 0.0,
+            "history_interval_seconds_median": statistics.median(history_intervals) if history_intervals else None,
             "projects_on_chosen_chains": dict(seen.most_common(15)),
         }
         return out
