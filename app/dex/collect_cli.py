@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--history-days",
         type=int,
         default=30,
-        help="Legacy daily chart span; retained for backward compatibility.",
+        help="History span in days (30 days means 720 points for hourly charts).",
     )
     parser.add_argument(
         "--history-period",
