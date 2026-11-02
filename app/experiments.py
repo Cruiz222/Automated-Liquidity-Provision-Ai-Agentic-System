@@ -239,57 +239,6 @@ class Registry:
 
     def close(self):
         self.db.close()
-class Registry:
-    def __init__(self, path=DEFAULT_REGISTRY):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=10)
-        self.db.row_factory = sqlite3.Row
-        try:
-            version = self.db.execute('PRAGMA user_version').fetchone()[0]
-            tables = self.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            if version == 0 and not tables:
-                with self.db:
-                    self.db.execute('''CREATE TABLE runs (
-                        id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
-                        status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
-                        created_at TEXT NOT NULL, finished_at TEXT,
-                        manifest_json TEXT NOT NULL, implementation_sha256 TEXT NOT NULL,
-                        python_version TEXT NOT NULL, result_path TEXT, result_sha256 TEXT,
-                        summary_json TEXT, error TEXT)''')
-                    self.db.execute("CREATE UNIQUE INDEX one_active ON runs(fingerprint) WHERE status='running'")
-                    self.db.execute('PRAGMA user_version=1')
-            elif version != 1 or {r[0] for r in tables} != {'runs'}:
-                raise ValueError('Not a supported experiment registry')
-            self.db.execute('PRAGMA journal_mode=WAL')
-            self.db.execute('PRAGMA synchronous=FULL')
-        except Exception:
-            self.db.close()
-            raise
-    def start(self, fingerprint, manifest, code_hash):
-        identifier = uuid.uuid4().hex
-        try:
-            with self.db:
-                self.db.execute('INSERT INTO runs (id,fingerprint,status,created_at,manifest_json,implementation_sha256,python_version) VALUES (?,?,?,?,?,?,?)',
-                    (identifier, fingerprint, 'running', now(), json.dumps(manifest, allow_nan=False), code_hash, platform.python_version()))
-        except sqlite3.IntegrityError:
-            raise ValueError('An identical study is already marked running; inspect it before starting another') from None
-        return identifier
-
-    def finish(self, identifier, status, error=None, result_path=None, result_sha256=None, summary=None):
-        if status not in ('completed', 'failed', 'interrupted'):
-            raise ValueError('A terminal run status is required')
-        with self.db:
-            changed = self.db.execute('UPDATE runs SET status=?, finished_at=?, error=?, result_path=?, result_sha256=?, summary_json=? WHERE id=? AND status=?',
-                (status, now(), error, str(result_path) if result_path else None, result_sha256,
-                 json.dumps(summary, allow_nan=False) if summary is not None else None, identifier, 'running')).rowcount
-            if changed != 1:
-                raise ValueError('Run is missing or is no longer running')
-
-    def close(self):
-        self.db.close()
-
-
 def read_runs(path=DEFAULT_REGISTRY, identifier=None, limit=50):
     path = Path(path)
     if not path.exists():
