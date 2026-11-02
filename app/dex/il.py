@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 
+SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
+
 
 def _check_price(value: float, name: str) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
@@ -82,12 +84,88 @@ def expected_v2_il(volatility: float, days: float, steps: int = 4001, z_max: flo
 
 
 def annualized_volatility(prices: list[float] | tuple[float, ...], periods_per_year: float = 365.0) -> float:
-    """Annualized standard deviation of log returns of a price series (needs >= 3 points)."""
+    """Annualized sample standard deviation of equally spaced log returns."""
     if len(prices) < 3:
         raise ValueError("at least 3 prices are required")
+    if (
+        isinstance(periods_per_year, bool)
+        or not isinstance(periods_per_year, (int, float))
+        or not math.isfinite(periods_per_year)
+        or periods_per_year <= 0
+    ):
+        raise ValueError("periods_per_year must be a positive finite number")
     for price in prices:
         _check_price(price, "price")
     returns = [math.log(b / a) for a, b in zip(prices, prices[1:])]
     mean = sum(returns) / len(returns)
     variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
     return math.sqrt(variance) * math.sqrt(periods_per_year)
+
+
+def annualized_volatility_from_observations(
+    observations: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    max_gap_seconds: float = 48.0 * 60.0 * 60.0,
+) -> float:
+    """Estimate annualized volatility from timestamped (timestamp, price) observations.
+
+    Uses realized quadratic variation per unit of elapsed time:
+
+        sqrt(sum(log_return ** 2) / sum(elapsed_seconds) * seconds_per_year)
+
+    Unlike :func:`annualized_volatility`, this does not assume equally spaced
+    samples and does not subtract the sample mean from returns. That is the
+    standard realized-variance estimator under a zero-drift diffusion model.
+
+    Every adjacent interval must be no longer than ``max_gap_seconds``.
+    Excessive gaps are rejected rather than treated as ordinary hourly/daily
+    returns or silently ignored, since doing either can materially bias risk.
+    At least two valid returns (three observations) are required.
+    """
+    if (
+        isinstance(max_gap_seconds, bool)
+        or not isinstance(max_gap_seconds, (int, float))
+        or not math.isfinite(max_gap_seconds)
+        or max_gap_seconds <= 0
+    ):
+        raise ValueError("max_gap_seconds must be a positive finite number")
+    if len(observations) < 3:
+        raise ValueError("at least 3 timestamped observations are required")
+
+    previous_timestamp: float | None = None
+    previous_price: float | None = None
+    squared_returns = 0.0
+    elapsed_seconds = 0.0
+
+    for point in observations:
+        if not isinstance(point, (tuple, list)) or len(point) != 2:
+            raise ValueError("each observation must be a (timestamp, price) pair")
+        timestamp, price = point
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+        ):
+            raise ValueError("observation timestamps must be non-negative finite numbers")
+        _check_price(price, "observation price")
+
+        if previous_timestamp is not None and previous_price is not None:
+            gap = timestamp - previous_timestamp
+            if gap <= 0:
+                raise ValueError("observation timestamps must be strictly increasing")
+            if gap > max_gap_seconds:
+                raise ValueError(
+                    f"observation gap {gap:.0f}s exceeds maximum {max_gap_seconds:.0f}s"
+                )
+            log_return = math.log(price / previous_price)
+            squared_returns += log_return * log_return
+            elapsed_seconds += gap
+
+        previous_timestamp = float(timestamp)
+        previous_price = float(price)
+
+    if elapsed_seconds <= 0:
+        raise ValueError("timestamped observations contain no elapsed time")
+
+    variance_per_second = squared_returns / elapsed_seconds
+    return math.sqrt(variance_per_second * SECONDS_PER_YEAR)

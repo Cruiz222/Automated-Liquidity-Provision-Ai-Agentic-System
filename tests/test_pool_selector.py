@@ -1,4 +1,5 @@
 import dataclasses
+import math
 import unittest
 from pathlib import Path
 
@@ -79,6 +80,55 @@ class TestEvaluation(unittest.TestCase):
         base, bad = selector().evaluate(stable, NOW), selector().evaluate(drifted, NOW)
         self.assertGreater(bad.depeg_haircut_apr, base.depeg_haircut_apr)
         self.assertGreater(bad.risk_score, base.risk_score)
+
+    def test_timestamped_hourly_history_drives_volatility_and_depeg(self):
+        stable = by_id(SNAPSHOTS, "usdc-usdt-arbitrum-1bp")
+        start = NOW - 29 * 86400
+        observations = tuple(
+            (start + i * 3600, 1.02)
+            for i in range(29 * 24 + 1)
+        )
+        snap = dataclasses.replace(
+            stable,
+            price_history=(1.0,) * 30,
+            price_observations=observations,
+        )
+        ev = selector().evaluate(snap, NOW)
+        self.assertAlmostEqual(ev.volatility, 0.02)
+        self.assertGreater(ev.depeg_haircut_apr, 0.0)
+
+    def test_timestamped_history_requires_calendar_coverage(self):
+        volatile = by_id(SNAPSHOTS, "weth-usdc-arbitrum-5bp")
+        start = NOW - 2 * 86400
+        observations = tuple(
+            (start + i * 3600, 3000.0 * math.exp(0.001 * i))
+            for i in range(49)
+        )
+        snap = dataclasses.replace(
+            volatile,
+            price_history=(),
+            price_observations=observations,
+        )
+        ev = selector().evaluate(snap, NOW)
+        self.assertIsNone(ev.volatility)
+        self.assertTrue(any("coverage" in reason for reason in ev.reasons))
+
+    def test_timestamped_history_rejects_excessive_observation_gaps(self):
+        volatile = by_id(SNAPSHOTS, "weth-usdc-arbitrum-5bp")
+        start = NOW - 20 * 86400
+        observations = (
+            (start, 3000.0),
+            (start + 3600, 3010.0),
+            (NOW, 3020.0),
+        )
+        snap = dataclasses.replace(
+            volatile,
+            price_history=(),
+            price_observations=observations,
+        )
+        ev = selector().evaluate(snap, NOW)
+        self.assertIsNone(ev.volatility)
+        self.assertTrue(any("exceeds maximum" in reason for reason in ev.reasons))
 
     def test_categories_follow_token_attributes(self):
         sel = selector()

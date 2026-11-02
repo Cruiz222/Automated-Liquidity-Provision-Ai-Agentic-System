@@ -64,7 +64,7 @@ class PoolSnapshot:
     fee_tier_bps: float | None = None
     volume_usd_1d: float | None = None
     volume_usd_7d: float | None = None
-    price_history: tuple[float, ...] = ()   # daily token0/token1 closes, oldest first
+    price_history: tuple[float, ...] = ()   # legacy price-only history; daily for older snapshots
     price_observations: tuple[tuple[float, float], ...] = ()
     # (unix timestamp, token0/token1 price), oldest first
     reported_fee_apr: float | None = None   # fraction (0.05 = 5%), from the data source
@@ -141,6 +141,8 @@ class PoolSnapshot:
 
     @property
     def latest_price(self) -> float | None:
+        if self.price_observations:
+            return self.price_observations[-1][1]
         return self.price_history[-1] if self.price_history else None
 
     def to_dict(self) -> dict[str, Any]:

@@ -5,7 +5,7 @@ import os
 import time
 import unittest
 from unittest import mock
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from app import feedcheck
 from app.config import Settings
@@ -46,8 +46,15 @@ POOL_ROWS = [
 ]
 
 
-def chart(price, days=30, start=NOW - 30 * 86400, jitter=0.0):
-    return {"symbol": "X", "confidence": 0.99, "prices": [{"timestamp": start + i * 86400 + jitter, "price": price * (1 + 0.01 * (i % 3))} for i in range(days)]}
+def chart(price, points=30, start=NOW - 30 * 86400, jitter=0.0, interval=86400):
+    return {
+        "symbol": "X",
+        "confidence": 0.99,
+        "prices": [
+            {"timestamp": start + i * interval + jitter, "price": price * (1 + 0.01 * (i % 3))}
+            for i in range(points)
+        ],
+    }
 
 
 def make_fetch(pools=None, low_confidence=(), fail_prices=False, fail_charts=False, calls=None):
@@ -70,7 +77,22 @@ def make_fetch(pools=None, low_confidence=(), fail_prices=False, fail_charts=Fal
             if fail_charts:
                 raise ProviderError("charts down")
             ids = unquote(url.split("chart/")[1].split("?")[0]).split(",")
-            return {"coins": {i: chart(prices[i], jitter=3600.0 if i.endswith(USDC) else 0.0) for i in ids if i in prices}}
+            query = parse_qs(url.split("?", 1)[1])
+            period = query.get("period", ["1d"])[0]
+            span = int(query.get("span", ["30"])[0])
+            interval = 3600 if period == "1h" else 86400
+            return {
+                "coins": {
+                    i: chart(
+                        prices[i],
+                        points=span,
+                        start=NOW - span * interval,
+                        jitter=3600.0 if period == "1d" and i.endswith(USDC) else 0.0,
+                        interval=interval,
+                    )
+                    for i in ids if i in prices
+                }
+            }
         raise AssertionError(url)
 
     return fetch
@@ -105,6 +127,47 @@ class TestDefiLlamaProvider(unittest.TestCase):
         self.assertEqual(eth.price_observations[1][0] - eth.price_observations[0][0], 86400)
         self.assertAlmostEqual(eth.price_observations[0][1], eth.price_history[0])
 
+    def test_hourly_history_uses_requested_resolution_and_tighter_alignment(self):
+        universe = PoolUniverse(
+            history_period="1h",
+            history_points=48,
+        )
+        provider = DefiLlamaPoolProvider(
+            universe,
+            make_fetch(),
+            clock=lambda: NOW,
+        )
+        eth = next(
+            pool for pool in provider.fetch_pools()
+            if pool.pool_id == "id-eth-usdc"
+        )
+        self.assertEqual(len(eth.price_observations), 48)
+        self.assertEqual(provider.last_report["history_observations_min"], 48)
+        self.assertEqual(provider.last_report["history_interval_seconds_median"], 3600)
+        self.assertAlmostEqual(provider.last_report["history_coverage_hours_min"], 47)
+        self.assertEqual(
+            eth.price_observations[1][0] - eth.price_observations[0][0],
+            3600,
+        )
+        self.assertEqual(
+            provider.last_report["history_period"],
+            "1h",
+        )
+        self.assertEqual(
+            provider.last_report["history_alignment_tolerance_seconds"],
+            900,
+        )
+
+    def test_hourly_alignment_does_not_match_a_one_hour_stale_token_price(self):
+        first = [(0.0, 10.0), (3600.0, 11.0), (7200.0, 12.0)]
+        second = [(3600.0, 1.0), (7200.0, 1.0), (10800.0, 1.0)]
+        aligned = DefiLlamaPoolProvider._ratio_observations(
+            first,
+            second,
+            tolerance=900,
+        )
+        self.assertEqual(aligned, [(3600.0, 11.0), (7200.0, 12.0)])
+
     def test_low_confidence_prices_are_not_used(self):
         pools = self.provider(low_confidence={"arbitrum:" + WETH}).fetch_pools()
         eth = next(p for p in pools if p.pool_id == "id-eth-usdc")
@@ -132,6 +195,9 @@ class TestDefiLlamaProvider(unittest.TestCase):
         report = provider.last_report
         self.assertEqual((report["rows"], report["after_filter"], report["snapshots"], report["with_usd_prices"]), (11, 2, 2, 2))
         self.assertEqual(report["with_price_history"], 2)
+        self.assertEqual(report["history_observations_min"], 30)
+        self.assertEqual(report["history_interval_seconds_median"], 86400)
+        self.assertAlmostEqual(report["history_coverage_hours_min"], 29 * 24)
         self.assertIn("uniswap-v3", report["projects_on_chosen_chains"])
 
     def test_many_coins_are_requested_in_small_batches(self):

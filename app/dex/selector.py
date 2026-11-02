@@ -26,7 +26,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .il import annualized_volatility, expected_v2_il
+from .il import (
+    annualized_volatility,
+    annualized_volatility_from_observations,
+    expected_v2_il,
+)
 from .pool_data import PoolCategory, PoolSnapshot
 
 MICRO = 1_000_000
@@ -55,6 +59,8 @@ class SelectorConfig:
     min_tvl_usd: float = 1_000_000.0
     min_daily_volume_usd: float = 50_000.0
     min_history_points: int = 14
+    min_history_days: float = 14.0
+    max_history_gap_hours: float = 48.0
     assumed_stable_vol: float = 0.02
     reserve_fraction: float = 0.10
     max_pool_weight: float = 0.40
@@ -70,6 +76,22 @@ class SelectorConfig:
     def __post_init__(self) -> None:
         if self.horizon_days <= 0:
             raise ValueError("horizon_days must be positive")
+        if self.min_history_points < 3:
+            raise ValueError("min_history_points must be at least 3")
+        if (
+            isinstance(self.min_history_days, bool)
+            or not isinstance(self.min_history_days, (int, float))
+            or not math.isfinite(self.min_history_days)
+            or self.min_history_days <= 0
+        ):
+            raise ValueError("min_history_days must be positive and finite")
+        if (
+            isinstance(self.max_history_gap_hours, bool)
+            or not isinstance(self.max_history_gap_hours, (int, float))
+            or not math.isfinite(self.max_history_gap_hours)
+            or self.max_history_gap_hours <= 0
+        ):
+            raise ValueError("max_history_gap_hours must be positive and finite")
         if not 0 <= self.reserve_fraction < 1:
             raise ValueError("reserve_fraction must be in [0, 1)")
         if not 0 < self.max_pool_weight <= 1 or not 0 < self.max_pool_tvl_share <= 1:
@@ -157,16 +179,64 @@ class PoolSelector:
 
     # ---- evaluation -------------------------------------------------------
 
+    @staticmethod
+    def _history_prices(pool: PoolSnapshot) -> tuple[float, ...]:
+        """Return timestamped observations when available, else legacy prices."""
+        if pool.price_observations:
+            return tuple(price for _, price in pool.price_observations)
+        return pool.price_history
+
     def _volatility(self, pool: PoolSnapshot, category: PoolCategory, reasons: list[str],
                     warnings: list[str]) -> float | None:
         cfg = self.config
-        if len(pool.price_history) >= cfg.min_history_points:
+
+        if pool.price_observations:
+            observations = pool.price_observations
+            coverage_days = (
+                observations[-1][0] - observations[0][0]
+            ) / 86400.0 if len(observations) >= 2 else 0.0
+
+            if len(observations) < 3:
+                history_error = (
+                    f"insufficient timestamped price history "
+                    f"({len(observations)} < 3 observations)"
+                )
+            elif coverage_days < cfg.min_history_days:
+                history_error = (
+                    f"insufficient price-history coverage "
+                    f"({coverage_days:.2f} < {cfg.min_history_days:.2f} days)"
+                )
+            else:
+                try:
+                    measured = annualized_volatility_from_observations(
+                        observations,
+                        max_gap_seconds=cfg.max_history_gap_hours * 3600.0,
+                    )
+                except ValueError as exc:
+                    history_error = f"invalid timestamped price history: {exc}"
+                else:
+                    return (
+                        max(measured, cfg.assumed_stable_vol)
+                        if category == PoolCategory.STABLECOIN_STABLECOIN
+                        else measured
+                    )
+        elif len(pool.price_history) >= cfg.min_history_points:
+            # Backward compatibility for old snapshots and fixtures whose
+            # histories have no timestamps and are documented as daily closes.
             measured = annualized_volatility(pool.price_history)
+            warnings.append("volatility uses legacy un-timestamped daily price history")
             return max(measured, cfg.assumed_stable_vol) if category == PoolCategory.STABLECOIN_STABLECOIN else measured
-        if category == PoolCategory.STABLECOIN_STABLECOIN:
+        else:
+            history_error = (
+                f"insufficient price history "
+                f"({len(pool.price_history)} < {cfg.min_history_points} daily points)"
+            )
+
+        if category == PoolCategory.STABLECOIN_STABLECOIN and not pool.price_observations and not pool.price_history:
             warnings.append(f"no price history; assuming {cfg.assumed_stable_vol:.0%} annual volatility")
             return cfg.assumed_stable_vol
-        reasons.append(f"insufficient price history ({len(pool.price_history)} < {cfg.min_history_points} points)")
+
+        reasons.append(history_error)
         return None
 
     def evaluate(self, pool: PoolSnapshot, now: float | None = None) -> PoolEvaluation:
@@ -220,8 +290,9 @@ class PoolSelector:
             il_apr = expected_v2_il(vol, cfg.horizon_days) * 365.0 / cfg.horizon_days
 
         depeg_component = 0.0
-        if category == PoolCategory.STABLECOIN_STABLECOIN and pool.price_history:
-            depeg_component = min(1.0, max(abs(p - 1.0) for p in pool.price_history) / 0.03)
+        history_prices = self._history_prices(pool)
+        if category == PoolCategory.STABLECOIN_STABLECOIN and history_prices:
+            depeg_component = min(1.0, max(abs(p - 1.0) for p in history_prices) / 0.03)
             if depeg_component >= 0.5:
                 warnings.append("relative price drifted more than 1.5% from parity in the history window")
         haircut = depeg_component * cfg.depeg_max_haircut_apr
