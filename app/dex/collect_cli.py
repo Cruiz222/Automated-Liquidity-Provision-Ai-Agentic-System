@@ -131,10 +131,15 @@ def print_result(result: Any) -> None:
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True), flush=True)
 
 
-def persist_result(db: sqlite3.Connection, result: Any) -> None:
-    """Commit a completed collection cycle before reporting success."""
+def persist_result(db: sqlite3.Connection, result: Any, provider: Any = None) -> None:
+    """Commit a completed collection cycle before reporting results."""
     db.commit()
     print_result(result)
+
+    diagnostics = getattr(provider, "last_report", None)
+    if diagnostics:
+        print("Provider diagnostics:", flush=True)
+        print(json.dumps(diagnostics, indent=2, sort_keys=True), flush=True)
 
 
 def main() -> int:
@@ -221,14 +226,14 @@ def main() -> int:
                 collector.collect_forever(
                     interval_seconds=args.interval,
                     max_cycles=args.cycles,
-                    on_result=lambda result: persist_result(db, result),
+                    on_result=lambda result: persist_result(db, result, provider),
                 )
             except KeyboardInterrupt:
                 print("\nCollection stopped by user.", flush=True)
             return 0
 
         result = collector.collect_once()
-        persist_result(db, result)
+        persist_result(db, result, provider)
         return 0 if result.ok else 1
 
     except Exception:

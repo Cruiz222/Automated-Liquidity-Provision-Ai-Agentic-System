@@ -17,7 +17,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from .http import ProviderError, fetch_json
 from .pool_data import PoolSnapshot, parse_defillama_pools
@@ -34,8 +34,9 @@ DEFAULT_CHAINS = ("ethereum", "arbitrum", "base", "polygon", "optimism")
 DEFAULT_PROJECTS = ("uniswap-v2", "uniswap-v3", "sushiswap", "aerodrome-v1", "aerodrome-slipstream", "pancakeswap-amm")
 DEFAULT_TOKENS = frozenset({"USDC", "USDT", "DAI", "WETH", "ETH", "WBTC", "CBBTC", "STETH", "WSTETH", "CBETH", "RETH"})
 MIN_PRICE_CONFIDENCE = 0.8
-BATCH = 30                                   # coins per price request (keeps URLs short)
-
+BATCH = 30                                   # coins per current-price request
+CHART_BATCH = 2                                # chart endpoint rejects larger tested batches
+CHART_WINDOW_MAX = 240
 
 @dataclass(frozen=True)
 class PoolUniverse:
@@ -94,6 +95,7 @@ class DefiLlamaPoolProvider:
                  clock: Callable[[], float] = time.time) -> None:
         self.universe, self._fetch, self._clock = universe or PoolUniverse(), fetch, clock
         self.last_report: dict[str, Any] = {}
+        self._chart_report: dict[str, Any] = {}
 
     # ---- universe filter -------------------------------------------------------
     def _eligible_rows(self, rows: Iterable[Any]) -> list[dict[str, Any]]:
@@ -124,6 +126,15 @@ class DefiLlamaPoolProvider:
         unique = sorted(set(ids))
         return [",".join(quote(i, safe=":,") for i in unique[k:k + BATCH]) for k in range(0, len(unique), BATCH)]
 
+    @staticmethod
+    def _chart_batches(ids: list[str]) -> list[str]:
+        """Build small, deterministic batches for the historical chart API."""
+        unique = sorted({coin.lower() for coin in ids})
+        return [
+            ",".join(quote(coin, safe=":,") for coin in unique[k:k + CHART_BATCH])
+            for k in range(0, len(unique), CHART_BATCH)
+        ]
+
     def _current_prices(self, ids: list[str]) -> dict[str, float]:
         prices: dict[str, float] = {}
         for batch in self._batches(ids):
@@ -138,25 +149,168 @@ class DefiLlamaPoolProvider:
         return prices
 
     def _charts(self, ids: list[str]) -> dict[str, list[tuple[float, float]]]:
+        """Fetch historical coin prices in bounded windows.
+
+        Windows are requested backwards using the earliest returned timestamp.
+        Overlapping observations are deduplicated by timestamp. Conflicting
+        prices for the same coin/timestamp are rejected.
+        """
+        target_points = self.universe.effective_history_span
+        period = self.universe.history_period
+
         charts: dict[str, list[tuple[float, float]]] = {}
-        for batch in self._batches(ids):
-            try:
-                coins = self._fetch(
-                    CHART_URL.format(
-                        coins=batch,
-                        span=self.universe.effective_history_span,
-                        period=self.universe.history_period,
+        requested = sorted({coin.lower() for coin in ids})
+
+        report = {
+            "requests": 0,
+            "failures": [],
+            "requested_coins": len(requested),
+            "batch_size": CHART_BATCH,
+            "retrieved_coins": 0,
+            "incomplete_coins": {},
+        }
+
+        for batch in self._chart_batches(ids):
+            batch_ids = [
+                coin.lower()
+                for coin in unquote(batch).split(",")
+            ]
+
+            # Timestamp -> price, independently for every coin.
+            merged: dict[str, dict[float, float]] = {
+                coin: {} for coin in batch_ids
+            }
+
+            end: int | None = None
+            previous_earliest: float | None = None
+
+            while True:
+                remaining = max(
+                    target_points - len(series)
+                    for series in merged.values()
+                )
+
+                if remaining <= 0:
+                    break
+
+                # Allow one extra point on subsequent requests because the API
+                # may include the previous window's boundary observation.
+                span = min(
+                    CHART_WINDOW_MAX,
+                    remaining if end is None else remaining + 1,
+                )
+
+                url = CHART_URL.format(
+                    coins=batch,
+                    span=span,
+                    period=period,
+                )
+
+                if end is not None:
+                    url += f"&end={end}"
+
+                report["requests"] += 1
+
+                try:
+                    payload = self._fetch(url)
+                except (ProviderError, AttributeError) as exc:
+                    report["failures"].append(
+                        f"Chart request failed: {type(exc).__name__}: {exc}"
                     )
-                ).get("coins", {})
-            except (ProviderError, AttributeError):
-                continue
-            for coin, record in coins.items():
-                points = record.get("prices") if isinstance(record, dict) else None
-                if isinstance(points, list):
-                    series = sorted((float(p["timestamp"]), float(p["price"])) for p in points
-                                    if isinstance(p, dict) and _finite(p.get("timestamp")) and _finite(p.get("price")) and p["price"] > 0)
-                    if series:
-                        charts[coin.lower()] = series
+                    break
+
+                coins = payload.get("coins") if isinstance(payload, dict) else None
+
+                if not isinstance(coins, dict):
+                    report["failures"].append(
+                        "Chart response did not contain a coins mapping"
+                    )
+                    break
+
+                window_timestamps: list[float] = []
+
+                for coin, record in coins.items():
+                    coin_id = coin.lower()
+
+                    if coin_id not in merged:
+                        continue
+
+                    points = record.get("prices") if isinstance(record, dict) else None
+
+                    if not isinstance(points, list):
+                        continue
+
+                    for point in points:
+                        if not isinstance(point, dict):
+                            continue
+
+                        timestamp = point.get("timestamp")
+                        price = point.get("price")
+
+                        if (
+                            not _finite(timestamp)
+                            or not _finite(price)
+                            or timestamp < 0
+                            or price <= 0
+                        ):
+                            continue
+
+                        timestamp = float(timestamp)
+                        price = float(price)
+
+                        existing = merged[coin_id].get(timestamp)
+
+                        if existing is not None and existing != price:
+                            raise ProviderError(
+                                "Conflicting historical prices for "
+                                f"{coin_id} at timestamp {timestamp}: "
+                                f"{existing} versus {price}"
+                            )
+
+                        merged[coin_id][timestamp] = price
+                        window_timestamps.append(timestamp)
+
+                if not window_timestamps:
+                    report["failures"].append(
+                        f"Chart response contained no usable observations "
+                        f"for batch beginning {batch_ids[0]}"
+                    )
+                    break
+
+                earliest = min(window_timestamps)
+
+                if (
+                    previous_earliest is not None
+                    and earliest >= previous_earliest
+                ):
+                    report["failures"].append(
+                        f"Historical pagination made no backward progress "
+                        f"for batch beginning {batch_ids[0]}"
+                    )
+                    break
+
+                previous_earliest = earliest
+
+                # The next request should cover the period before this window.
+                end = math.floor(earliest) - 1
+
+            for coin_id, observations in merged.items():
+                if observations:
+                    series = sorted(observations.items())
+                    charts[coin_id] = series[-target_points:]
+
+        report["retrieved_coins"] = sum(
+            len(charts.get(coin, [])) >= target_points
+            for coin in requested
+        )
+
+        report["incomplete_coins"] = {
+            coin: len(charts.get(coin, []))
+            for coin in requested
+            if len(charts.get(coin, [])) < target_points
+        }
+
+        self._chart_report = report
         return charts
 
     @staticmethod
@@ -251,6 +405,7 @@ class DefiLlamaPoolProvider:
             "history_coverage_hours_min": min(history_coverage_hours) if history_coverage_hours else 0.0,
             "history_coverage_hours_median": statistics.median(history_coverage_hours) if history_coverage_hours else 0.0,
             "history_interval_seconds_median": statistics.median(history_intervals) if history_intervals else None,
+            "chart_retrieval": dict(self._chart_report),
             "projects_on_chosen_chains": dict(seen.most_common(15)),
         }
         return out

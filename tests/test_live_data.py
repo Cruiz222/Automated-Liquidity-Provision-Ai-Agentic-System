@@ -158,6 +158,146 @@ class TestDefiLlamaProvider(unittest.TestCase):
             900,
         )
 
+    def test_720_hourly_observations_are_paginated_and_deduplicated(self):
+        universe = PoolUniverse(
+            history_period="1h",
+            history_points=720,
+        )
+        calls = []
+        prices = {
+            "arbitrum:" + WETH: 3000.0,
+            "arbitrum:" + USDC: 1.0,
+        }
+
+        def fetch(url):
+            if url.startswith(CHART_URL.split("{")[0]):
+                calls.append(url)
+                ids = unquote(url.split("chart/")[1].split("?")[0]).split(",")
+                query = parse_qs(url.split("?", 1)[1])
+                span = int(query["span"][0])
+                end = query.get("end")
+
+                last = NOW if end is None else float(end[0]) + 1
+                first = last - (span - 1) * 3600
+
+                return {
+                    "coins": {
+                        coin: {
+                            "prices": [
+                                {
+                                    "timestamp": first + i * 3600,
+                                    "price": prices[coin],
+                                }
+                                for i in range(span)
+                            ]
+                        }
+                        for coin in ids if coin in prices
+                    }
+                }
+
+            return make_fetch()(url)
+
+        provider = DefiLlamaPoolProvider(
+            universe,
+            fetch,
+            clock=lambda: NOW,
+        )
+
+        charts = provider._charts(list(prices))
+
+        self.assertGreaterEqual(len(calls), 4)
+        for coin in prices:
+            self.assertEqual(len(charts[coin]), 720)
+            timestamps = [timestamp for timestamp, _ in charts[coin]]
+            self.assertEqual(timestamps, sorted(set(timestamps)))
+            self.assertEqual(
+                timestamps[-1] - timestamps[0],
+                719 * 3600,
+            )
+
+    def test_chart_requests_use_small_batches(self):
+        universe = PoolUniverse(
+            history_period="1h",
+            history_points=3,
+        )
+        coins = [
+            f"ethereum:0x{i:040x}"
+            for i in range(1, 5)
+        ]
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            ids = unquote(url.split("chart/")[1].split("?")[0]).split(",")
+            query = parse_qs(url.split("?", 1)[1])
+            self.assertEqual(int(query["span"][0]), 3)
+            self.assertLessEqual(len(ids), 2)
+
+            return {
+                "coins": {
+                    coin: {
+                        "prices": [
+                            {"timestamp": timestamp, "price": 100.0 + index}
+                            for index, timestamp in enumerate((1000, 4600, 8200))
+                        ]
+                    }
+                    for coin in ids
+                }
+            }
+
+        provider = DefiLlamaPoolProvider(universe, fetch)
+        charts = provider._charts(coins)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(set(charts), set(coins))
+        self.assertTrue(all(len(charts[coin]) == 3 for coin in coins))
+        self.assertEqual(provider._chart_report["batch_size"], 2)
+        self.assertEqual(provider._chart_report["retrieved_coins"], 4)
+        self.assertEqual(provider._chart_report["incomplete_coins"], {})
+
+    def test_conflicting_duplicate_chart_prices_are_rejected(self):
+        universe = PoolUniverse(
+            history_period="1h",
+            history_points=720,
+        )
+        calls = 0
+        coin = "arbitrum:" + WETH
+
+        def fetch(url):
+            nonlocal calls
+            calls += 1
+            query = parse_qs(url.split("?", 1)[1])
+
+            if "end" not in query:
+                timestamps = list(range(240))
+                prices = [3000.0] * 240
+            else:
+                timestamps = list(range(-239, 1))
+                prices = [3000.0] * 240
+                prices[-1] = 3100.0
+
+            return {
+                "coins": {
+                    coin: {
+                        "prices": [
+                            {"timestamp": ts, "price": price}
+                            for ts, price in zip(timestamps, prices)
+                        ]
+                    }
+                }
+            }
+
+        provider = DefiLlamaPoolProvider(
+            universe,
+            fetch,
+            clock=lambda: NOW,
+        )
+
+        with self.assertRaises(ProviderError):
+            provider._charts([coin])
+
+        self.assertEqual(calls, 2)
+
     def test_hourly_alignment_does_not_match_a_one_hour_stale_token_price(self):
         first = [(0.0, 10.0), (3600.0, 11.0), (7200.0, 12.0)]
         second = [(3600.0, 1.0), (7200.0, 1.0), (10800.0, 1.0)]
