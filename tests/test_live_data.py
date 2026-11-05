@@ -308,6 +308,57 @@ class TestDefiLlamaProvider(unittest.TestCase):
         )
         self.assertEqual(aligned, [(3600.0, 11.0), (7200.0, 12.0)])
 
+    def test_hourly_alignment_achieves_maximum_matches_for_representative_series(self):
+        def maximum_matches(first, second, tolerance):
+            n, m = len(first), len(second)
+            dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+            for i in range(n - 1, -1, -1):
+                for j in range(m - 1, -1, -1):
+                    best = max(dp[i + 1][j], dp[i][j + 1])
+
+                    if abs(first[i][0] - second[j][0]) <= tolerance:
+                        best = max(best, 1 + dp[i + 1][j + 1])
+
+                    dp[i][j] = best
+
+            return dp[0][0]
+
+        cases = [
+            (
+                [(0.0, 10.0), (3600.0, 11.0), (7200.0, 12.0)],
+                [(100.0, 1.0), (3700.0, 1.0), (7300.0, 1.0)],
+                900,
+            ),
+            (
+                [(0.0, 10.0), (3600.0, 11.0), (7200.0, 12.0)],
+                [(3600.0, 1.0), (7200.0, 1.0), (10800.0, 1.0)],
+                900,
+            ),
+            (
+                [(0.0, 10.0), (3600.0, 11.0), (7200.0, 12.0)],
+                [(2000.0, 1.0), (3800.0, 1.0), (10000.0, 1.0)],
+                900,
+            ),
+        ]
+
+        for first, second, tolerance in cases:
+            with self.subTest(first=first, second=second):
+                aligned = DefiLlamaPoolProvider._ratio_observations(
+                    first,
+                    second,
+                    tolerance=tolerance,
+                )
+
+                maximum = maximum_matches(first, second, tolerance)
+
+                self.assertEqual(len(aligned), maximum)
+                self.assertEqual(
+                    len({timestamp for timestamp, _ in aligned}),
+                    len(aligned),
+                    "A first-token observation must not be reused.",
+                )
+
     def test_low_confidence_prices_are_not_used(self):
         pools = self.provider(low_confidence={"arbitrum:" + WETH}).fetch_pools()
         eth = next(p for p in pools if p.pool_id == "id-eth-usdc")
