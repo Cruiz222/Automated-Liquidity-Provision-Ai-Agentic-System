@@ -350,6 +350,58 @@ class DefiLlamaPoolProvider:
             for _, price in DefiLlamaPoolProvider._ratio_observations(first, second, tolerance)
         ]
 
+    @staticmethod
+    def _history_quality(
+        snapshot: PoolSnapshot,
+        expected_interval_seconds: float,
+        expected_points: int,
+    ) -> dict[str, Any]:
+        """Describe timestamp coverage without modifying historical observations."""
+        observations = snapshot.price_observations
+        timestamps = [timestamp for timestamp, _ in observations]
+        intervals = [
+            right - left
+            for left, right in zip(timestamps, timestamps[1:])
+        ]
+
+        coverage_hours = (
+            (timestamps[-1] - timestamps[0]) / 3600.0
+            if len(timestamps) >= 2
+            else None
+        )
+
+        # Allow normal source timestamp jitter. A gap beyond 1.5 expected
+        # intervals indicates at least one missing expected observation.
+        missing_intervals = sum(
+            max(0, round(gap / expected_interval_seconds) - 1)
+            for gap in intervals
+            if gap > expected_interval_seconds * 1.5
+        )
+
+        latest_age_minutes = (
+            (snapshot.as_of - timestamps[-1]) / 60.0
+            if timestamps
+            else None
+        )
+
+        return {
+            "pool_id": snapshot.pool_id,
+            "observation_count": len(observations),
+            "alignment_coverage_pct": (
+                len(observations) / expected_points * 100.0
+                if expected_points > 0
+                else 0.0
+            ),
+            "coverage_hours": coverage_hours,
+            "missing_intervals": missing_intervals,
+            "largest_gap_hours": (
+                max(intervals) / 3600.0
+                if intervals
+                else None
+            ),
+            "latest_observation_age_minutes": latest_age_minutes,
+        }
+
     # ---- main entry ------------------------------------------------------------------
     def fetch_pools(self) -> list[PoolSnapshot]:
         payload = self._fetch(POOLS_URL)
@@ -390,6 +442,18 @@ class DefiLlamaPoolProvider:
             for pool in out
             for left, right in zip(pool.price_observations, pool.price_observations[1:])
         ]
+        expected_interval_seconds = (
+            3600.0 if self.universe.history_period == "1h" else 86400.0
+        )
+        pool_history_quality = [
+            self._history_quality(
+                pool,
+                expected_interval_seconds,
+                self.universe.effective_history_span,
+            )
+            for pool in out
+        ]
+
         self.last_report = {
             "rows": len(rows),
             "after_filter": len(chosen),
@@ -405,6 +469,7 @@ class DefiLlamaPoolProvider:
             "history_coverage_hours_min": min(history_coverage_hours) if history_coverage_hours else 0.0,
             "history_coverage_hours_median": statistics.median(history_coverage_hours) if history_coverage_hours else 0.0,
             "history_interval_seconds_median": statistics.median(history_intervals) if history_intervals else None,
+            "pool_history_quality": pool_history_quality,
             "chart_retrieval": dict(self._chart_report),
             "projects_on_chosen_chains": dict(seen.most_common(15)),
         }

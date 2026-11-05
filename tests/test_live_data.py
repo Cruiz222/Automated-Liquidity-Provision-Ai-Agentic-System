@@ -340,6 +340,68 @@ class TestDefiLlamaProvider(unittest.TestCase):
         self.assertAlmostEqual(report["history_coverage_hours_min"], 29 * 24)
         self.assertIn("uniswap-v3", report["projects_on_chosen_chains"])
 
+    def test_pool_history_quality_reports_gaps_and_staleness(self):
+        from app.dex.pool_data import PoolSnapshot
+
+        snapshot = PoolSnapshot(
+            pool_id="quality-test-pool",
+            chain="ethereum",
+            dex="uniswap-v3",
+            token0="WETH",
+            token1="USDC",
+            tvl_usd=10_000_000,
+            price_observations=(
+                (0.0, 3000.0),
+                (3600.0, 3010.0),
+                (7200.0, 3020.0),
+                (14400.0, 3030.0),
+                (18000.0, 3040.0),
+            ),
+            as_of=19800.0,
+        )
+
+        quality = DefiLlamaPoolProvider._history_quality(
+            snapshot,
+            expected_interval_seconds=3600,
+            expected_points=5,
+        )
+
+        self.assertEqual(quality["pool_id"], "quality-test-pool")
+        self.assertEqual(quality["observation_count"], 5)
+        self.assertAlmostEqual(quality["alignment_coverage_pct"], 100.0)
+        self.assertAlmostEqual(quality["coverage_hours"], 5.0)
+        self.assertEqual(quality["missing_intervals"], 1)
+        self.assertAlmostEqual(quality["largest_gap_hours"], 2.0)
+        self.assertAlmostEqual(
+            quality["latest_observation_age_minutes"], 30.0
+        )
+
+    def test_pool_history_quality_handles_empty_history(self):
+        from app.dex.pool_data import PoolSnapshot
+
+        snapshot = PoolSnapshot(
+            pool_id="empty-history-pool",
+            chain="ethereum",
+            dex="uniswap-v3",
+            token0="WETH",
+            token1="USDC",
+            tvl_usd=10_000_000,
+            as_of=19800.0,
+        )
+
+        quality = DefiLlamaPoolProvider._history_quality(
+            snapshot,
+            expected_interval_seconds=3600,
+            expected_points=720,
+        )
+
+        self.assertEqual(quality["observation_count"], 0)
+        self.assertEqual(quality["alignment_coverage_pct"], 0.0)
+        self.assertIsNone(quality["coverage_hours"])
+        self.assertEqual(quality["missing_intervals"], 0)
+        self.assertIsNone(quality["largest_gap_hours"])
+        self.assertIsNone(quality["latest_observation_age_minutes"])
+
     def test_many_coins_are_requested_in_small_batches(self):
         many = [row(pool=f"p{i}", underlyingTokens=[f"0x{i:040x}", f"0x{i + 1000:040x}"], tvlUsd=1e9 - i) for i in range(20)]
         calls = []
