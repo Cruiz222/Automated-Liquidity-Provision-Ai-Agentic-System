@@ -1,5 +1,16 @@
 """DEX historical backtesting components."""
 
+from .eligibility import (
+    EligibilityConfig,
+    EligibilityReport,
+    EligibilityStatus,
+    IdentityConfidence,
+    MarketGroup,
+    PoolEligibility,
+    build_eligibility_report,
+    build_eligibility_report_from_database,
+)
+
 from .market_data import (
     HistoricalMarketData,
     HistoricalMarketDataLoader,
@@ -33,6 +44,14 @@ from .oos import (
 )
 
 __all__ = [
+    "build_eligibility_report_from_database",
+    "build_eligibility_report",
+    "PoolEligibility",
+    "MarketGroup",
+    "IdentityConfidence",
+    "EligibilityStatus",
+    "EligibilityReport",
+    "EligibilityConfig",
     "HistoricalMarketData",
     "HistoricalMarketDataLoader",
     "PricePoint",
