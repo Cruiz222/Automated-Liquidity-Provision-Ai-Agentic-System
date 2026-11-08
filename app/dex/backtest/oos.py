@@ -253,7 +253,66 @@ class DEXOutOfSampleEvaluator:
                 continue
 
             try:
-                market_data = self.market_loader.load_pool(pool_id)
+                # Build the two sides of the evaluation from distinct
+                # information sets. Training observations must come from
+                # snapshots already collected by the decision cutoff.
+                training_data = self.market_loader.load_pool(
+                    pool_id,
+                    end_timestamp=cutoff,
+                    end_as_of=cutoff,
+                )
+
+                # Test observations are evaluated after the decision. They
+                # may come from later-collected snapshots, but their market
+                # timestamps must also be strictly after the cutoff. This
+                # prevents later backfills from leaking into training.
+                test_start = math.nextafter(cutoff, math.inf)
+                testing_data = self.market_loader.load_pool(
+                    pool_id,
+                    start_timestamp=test_start,
+                    start_as_of=test_start,
+                )
+
+                if training_data.chain != testing_data.chain:
+                    raise ValueError("training and testing chains differ")
+
+                if (
+                    training_data.token0.upper()
+                    != testing_data.token0.upper()
+                    or training_data.token1.upper()
+                    != testing_data.token1.upper()
+                ):
+                    raise ValueError(
+                        "training and testing token orientation differs"
+                    )
+
+                training_addresses = training_data.token_addresses
+                testing_addresses = testing_data.token_addresses
+
+                if bool(training_addresses) != bool(testing_addresses):
+                    raise ValueError(
+                        "training and testing contract identity availability differs"
+                    )
+
+                if (
+                    training_addresses
+                    and training_addresses != testing_addresses
+                ):
+                    raise ValueError(
+                        "training and testing token contract addresses differ"
+                    )
+
+                market_data = HistoricalMarketData(
+                    pool_id=pool_id,
+                    token0=training_data.token0,
+                    token1=training_data.token1,
+                    chain=training_data.chain,
+                    observations=(
+                        *training_data.observations,
+                        *testing_data.observations,
+                    ),
+                    token_addresses=training_addresses,
+                )
                 split = self.splitter.split(market_data, cutoff)
             except (ValueError, DataSplitError) as exc:
                 exclusions[pool_id] = [
@@ -376,7 +435,9 @@ class DEXOutOfSampleEvaluator:
                 pool_id=pool_id,
                 token0=split.training.token0,
                 token1=split.training.token1,
+                chain=split.training.chain,
                 observations=(anchor, *split.testing.observations),
+                token_addresses=split.training.token_addresses,
             )
 
             gross = self.portfolio_model.run(

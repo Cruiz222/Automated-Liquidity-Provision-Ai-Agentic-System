@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app.dex.snapshot_store import SnapshotStore
+from app.dex.token_identity import normalize_chain, normalize_token_addresses
 from .market_data import HistoricalMarketDataLoader
 
 
@@ -195,7 +196,7 @@ class EligibilityReport:
 def _market_identity(snapshot) -> tuple[str | None, IdentityConfidence]:
     """Build a chain-aware, order-independent identity for a token pair."""
 
-    chain = snapshot.chain.strip().lower()
+    chain = normalize_chain(snapshot.chain)
     addresses = snapshot.token_addresses
 
     if len(addresses) == 2 and all(
@@ -205,7 +206,7 @@ def _market_identity(snapshot) -> tuple[str | None, IdentityConfidence]:
         identity = (
             chain,
             "address",
-            *sorted(address.strip().lower() for address in addresses),
+            *sorted(normalize_token_addresses(chain, tuple(addresses))),
         )
         confidence = IdentityConfidence.HIGH
     elif snapshot.token0.strip() and snapshot.token1.strip():

@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote, unquote
 
 from .http import ProviderError, fetch_json
+from .token_identity import normalize_coin_id
 from .pool_data import PoolSnapshot, parse_defillama_pools
 
 POOLS_URL = "https://yields.llama.fi/pools"
@@ -120,16 +121,19 @@ class DefiLlamaPoolProvider:
         prefix = CHAIN_PREFIX.get(snapshot.chain.lower())
         if prefix is None or len(snapshot.token_addresses) != 2:
             return None
-        return [f"{prefix}:{address}" for address in snapshot.token_addresses]
+        return [
+            normalize_coin_id(f"{prefix}:{address}")
+            for address in snapshot.token_addresses
+        ]
 
     def _batches(self, ids: list[str]) -> list[str]:
-        unique = sorted(set(ids))
+        unique = sorted({normalize_coin_id(coin) for coin in ids})
         return [",".join(quote(i, safe=":,") for i in unique[k:k + BATCH]) for k in range(0, len(unique), BATCH)]
 
     @staticmethod
     def _chart_batches(ids: list[str]) -> list[str]:
         """Build small, deterministic batches for the historical chart API."""
-        unique = sorted({coin.lower() for coin in ids})
+        unique = sorted({normalize_coin_id(coin) for coin in ids})
         return [
             ",".join(quote(coin, safe=":,") for coin in unique[k:k + CHART_BATCH])
             for k in range(0, len(unique), CHART_BATCH)
@@ -145,7 +149,7 @@ class DefiLlamaPoolProvider:
             for coin, record in coins.items():
                 if isinstance(record, dict) and _finite(record.get("price")) and record["price"] > 0 \
                         and _finite(record.get("confidence", 1.0)) and record.get("confidence", 1.0) >= MIN_PRICE_CONFIDENCE:
-                    prices[coin.lower()] = float(record["price"])
+                    prices[normalize_coin_id(coin)] = float(record["price"])
         return prices
 
     def _charts(self, ids: list[str]) -> dict[str, list[tuple[float, float]]]:
@@ -159,7 +163,7 @@ class DefiLlamaPoolProvider:
         period = self.universe.history_period
 
         charts: dict[str, list[tuple[float, float]]] = {}
-        requested = sorted({coin.lower() for coin in ids})
+        requested = sorted({normalize_coin_id(coin) for coin in ids})
 
         report = {
             "requests": 0,
@@ -172,7 +176,7 @@ class DefiLlamaPoolProvider:
 
         for batch in self._chart_batches(ids):
             batch_ids = [
-                coin.lower()
+                normalize_coin_id(coin)
                 for coin in unquote(batch).split(",")
             ]
 
@@ -230,7 +234,7 @@ class DefiLlamaPoolProvider:
                 window_timestamps: list[float] = []
 
                 for coin, record in coins.items():
-                    coin_id = coin.lower()
+                    coin_id = normalize_coin_id(coin)
 
                     if coin_id not in merged:
                         continue
@@ -417,12 +421,12 @@ class DefiLlamaPoolProvider:
         out, priced, with_history = [], 0, 0
         for snapshot in snapshots:
             pair = self._coin_ids(snapshot)
-            p0, p1 = (prices.get(pair[0].lower()), prices.get(pair[1].lower())) if pair else (None, None)
+            p0, p1 = (prices.get(pair[0]), prices.get(pair[1])) if pair else (None, None)
             observations: list[tuple[float, float]] = []
-            if pair and pair[0].lower() in charts and pair[1].lower() in charts:
+            if pair and pair[0] in charts and pair[1] in charts:
                 observations = self._ratio_observations(
-                    charts[pair[0].lower()],
-                    charts[pair[1].lower()],
+                    charts[pair[0]],
+                    charts[pair[1]],
                     tolerance=self.universe.effective_alignment_tolerance_seconds,
                 )
             history = tuple(price for _, price in observations)

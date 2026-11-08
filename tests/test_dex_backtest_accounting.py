@@ -19,6 +19,7 @@ class TestLPAccountingModel(unittest.TestCase):
 
         market_data = HistoricalMarketData(
             pool_id="pool-1",
+            chain="ethereum",
             token0="ETH",
             token1="USDT",
             observations=(

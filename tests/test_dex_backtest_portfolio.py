@@ -17,6 +17,7 @@ class TestV2LPPortfolioModel(unittest.TestCase):
     def make_market_data(self, prices):
         return HistoricalMarketData(
             pool_id="pool-1",
+            chain="ethereum",
             token0="ETH",
             token1="USDT",
             observations=tuple(

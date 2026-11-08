@@ -14,6 +14,7 @@ class TestChronologicalMarketDataSplitter(unittest.TestCase):
     def setUp(self):
         self.market_data = HistoricalMarketData(
             pool_id="eth-usdc-test",
+            chain="ethereum",
             token0="ETH",
             token1="USDC",
             observations=(
@@ -58,6 +59,12 @@ class TestChronologicalMarketDataSplitter(unittest.TestCase):
         self.assertEqual(result.training.token1, "USDC")
         self.assertEqual(result.testing.token0, "ETH")
         self.assertEqual(result.testing.token1, "USDC")
+
+    def test_preserves_chain_in_both_split_periods(self):
+        result = self.splitter.split(self.market_data, 300)
+
+        self.assertEqual(result.training.chain, "ethereum")
+        self.assertEqual(result.testing.chain, "ethereum")
 
     def test_preserves_all_observations_without_duplication(self):
         result = self.splitter.split(self.market_data, 300)

@@ -34,6 +34,7 @@ class TestDEXOutOfSampleEvaluator(unittest.TestCase):
         as_of=CUTOFF,
         token0="USDC",
         token1="USDT",
+        token_addresses=(),
         price1_usd=1.0,
         price_observations=None,
         price_history=(),
@@ -54,6 +55,7 @@ class TestDEXOutOfSampleEvaluator(unittest.TestCase):
             dex="uniswap-v2",
             token0=token0,
             token1=token1,
+            token_addresses=token_addresses,
             tvl_usd=tvl_usd,
             fee_tier_bps=fee_tier_bps,
             volume_usd_1d=volume_usd_1d,
@@ -103,6 +105,46 @@ class TestDEXOutOfSampleEvaluator(unittest.TestCase):
         self.assertEqual(selected_snapshot.as_of, CUTOFF)
         self.assertEqual(selected_snapshot.reported_fee_apr, 0.10)
 
+    def test_future_backfill_cannot_change_training_selector_history(self):
+        self.add_valid_pool()
+
+        # This observation occurred before the cutoff but was only added to
+        # the database by a snapshot collected after the decision time.
+        backfilled_observations = [
+            (day * DAY, 1.0 + (day % 3) * 0.0001)
+            for day in range(1, 20)
+        ]
+        backfilled_observations.extend([
+            (19.5 * DAY, 1.25),
+
+        # Exact cutoff observation: it must not enter the OOS test period.
+        # Its price matches the original day-20 observation.
+            (CUTOFF, 1.0002),
+
+            (21 * DAY, 1.0005),
+            (22 * DAY, 1.0008),
+            (23 * DAY, 1.0004),
+        ])
+        self.store.save(self.make_snapshot(
+            as_of=CUTOFF + 2 * DAY,
+            price_observations=tuple(backfilled_observations),
+        ))
+
+        result = DEXOutOfSampleEvaluator(self.store).run(
+            CUTOFF,
+            10_000 * 1_000_000,
+        )
+        evaluation = next(
+            item for item in result.selection.evaluations
+            if item.pool_id == "USDC-USDT"
+        )
+
+        expected_last_training_price = 1.0 + (19 % 3) * 0.0001
+        self.assertAlmostEqual(
+            evaluation.latest_price,
+            expected_last_training_price,
+        )
+
     def test_rebuilds_selector_history_without_un_timestamped_values(self):
         self.add_valid_pool()
 
@@ -145,6 +187,84 @@ class TestDEXOutOfSampleEvaluator(unittest.TestCase):
             pool.gross_portfolio.initial_timestamp,
             pool.anchor_timestamp,
         )
+
+    def test_excludes_future_snapshot_with_changed_token_orientation(self):
+        self.store.save(self.make_snapshot())
+        self.store.save(self.make_snapshot(
+            as_of=CUTOFF + DAY,
+            token0="USDT",
+            token1="USDC",
+            price_observations=(
+                (21 * DAY, 1.0005),
+                (22 * DAY, 1.0008),
+                (23 * DAY, 1.0004),
+            ),
+        ))
+
+        with self.assertRaises(OOSBacktestError):
+            DEXOutOfSampleEvaluator(self.store).run(
+                CUTOFF,
+                1_000 * 1_000_000,
+            )
+
+    def test_rejects_different_contracts_with_identical_symbols(self):
+        self.store.save(self.make_snapshot(
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.store.save(self.make_snapshot(
+            as_of=CUTOFF + DAY,
+            token_addresses=("0xccc", "0xddd"),
+            price_observations=(
+                (21 * DAY, 1.0005),
+                (22 * DAY, 1.0008),
+                (23 * DAY, 1.0004),
+            ),
+        ))
+
+        with self.assertRaises(OOSBacktestError):
+            DEXOutOfSampleEvaluator(self.store).run(
+                CUTOFF,
+                1_000 * 1_000_000,
+            )
+
+    def test_rejects_missing_contract_identity_on_one_side(self):
+        self.store.save(self.make_snapshot(
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.store.save(self.make_snapshot(
+            as_of=CUTOFF + DAY,
+            price_observations=(
+                (21 * DAY, 1.0005),
+                (22 * DAY, 1.0008),
+                (23 * DAY, 1.0004),
+            ),
+        ))
+
+        with self.assertRaises(OOSBacktestError):
+            DEXOutOfSampleEvaluator(self.store).run(
+                CUTOFF,
+                1_000 * 1_000_000,
+            )
+
+    def test_rejects_reversed_contract_order(self):
+        self.store.save(self.make_snapshot(
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.store.save(self.make_snapshot(
+            as_of=CUTOFF + DAY,
+            token_addresses=("0xbbb", "0xaaa"),
+            price_observations=(
+                (21 * DAY, 1.0005),
+                (22 * DAY, 1.0008),
+                (23 * DAY, 1.0004),
+            ),
+        ))
+
+        with self.assertRaises(OOSBacktestError):
+            DEXOutOfSampleEvaluator(self.store).run(
+                CUTOFF,
+                1_000 * 1_000_000,
+            )
 
     def test_excludes_non_stable_quote_token(self):
         snapshot = self.make_snapshot(

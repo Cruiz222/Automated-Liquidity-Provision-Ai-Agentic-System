@@ -23,13 +23,16 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
         observations,
         token0="ETH",
         token1="USDT",
+        token_addresses=(),
+        chain="ethereum",
     ):
         return PoolSnapshot(
             pool_id="pool-1",
-            chain="ethereum",
+            chain=chain,
             dex="uniswap",
             token0=token0,
             token1=token1,
+            token_addresses=token_addresses,
             tvl_usd=100_000,
             price_observations=tuple(observations),
             as_of=as_of,
@@ -103,6 +106,29 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
             [20, 30],
         )
 
+    def test_snapshot_collection_time_bounds_are_inclusive(self):
+        self.save(self.make_snapshot(100, [(10, 3000)]))
+        self.save(self.make_snapshot(200, [(20, 3100)]))
+        self.save(self.make_snapshot(300, [(30, 3200)]))
+
+        result = self.loader.load_pool(
+            "pool-1",
+            start_as_of=200,
+            end_as_of=300,
+        )
+
+        self.assertEqual(
+            [(point.timestamp, point.price) for point in result.observations],
+            [(20, 3100), (30, 3200)],
+        )
+
+    def test_invalid_snapshot_collection_time_bounds_fail(self):
+        with self.assertRaises(ValueError):
+            self.loader.load_pool("pool-1", start_as_of=300, end_as_of=200)
+
+        with self.assertRaises(ValueError):
+            self.loader.load_pool("pool-1", end_as_of=float("nan"))
+
     def test_empty_time_range_fails(self):
         self.save(self.make_snapshot(
             100,
@@ -134,6 +160,97 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
         ))
 
         with self.assertRaisesRegex(ValueError, "inconsistent token orientation"):
+            self.loader.load_pool("pool-1")
+
+    def test_preserves_token_contract_addresses(self):
+        addresses = ("0xAbC123", "0xDeF456")
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000), (20, 3100)],
+            token_addresses=addresses,
+        ))
+
+        result = self.loader.load_pool("pool-1")
+
+        self.assertEqual(
+            result.token_addresses,
+            ("0xabc123", "0xdef456"),
+        )
+
+    def test_preserves_solana_base58_address_case(self):
+        addresses = (
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            token_addresses=addresses,
+            chain="solana",
+        ))
+
+        result = self.loader.load_pool("pool-1")
+
+        self.assertEqual(result.chain, "solana")
+        self.assertEqual(result.token_addresses, addresses)
+
+    def test_rejects_chain_change_across_pool_snapshots(self):
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            chain="ethereum",
+        ))
+        self.save(self.make_snapshot(
+            200,
+            [(20, 3100)],
+            chain="solana",
+        ))
+
+        with self.assertRaisesRegex(ValueError, "inconsistent chain identity"):
+            self.loader.load_pool("pool-1")
+
+    def test_inconsistent_token_contract_addresses_fail(self):
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.save(self.make_snapshot(
+            200,
+            [(20, 3100)],
+            token_addresses=("0xccc", "0xddd"),
+        ))
+
+        with self.assertRaisesRegex(ValueError, "inconsistent token contract"):
+            self.loader.load_pool("pool-1")
+
+    def test_mixed_address_availability_fails(self):
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.save(self.make_snapshot(
+            200,
+            [(20, 3100)],
+        ))
+
+        with self.assertRaisesRegex(ValueError, "incomplete token contract"):
+            self.loader.load_pool("pool-1")
+
+    def test_reversed_token_contract_addresses_fail(self):
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            token_addresses=("0xaaa", "0xbbb"),
+        ))
+        self.save(self.make_snapshot(
+            200,
+            [(20, 3100)],
+            token_addresses=("0xbbb", "0xaaa"),
+        ))
+
+        with self.assertRaisesRegex(ValueError, "inconsistent token contract"):
             self.loader.load_pool("pool-1")
 
     def test_invalid_time_bounds_fail(self):

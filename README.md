@@ -86,3 +86,101 @@ examples/      synthetic pool snapshot
 docs/          ARCHITECTURE.md, SECURITY.md, PAYOUTS.md, DEPLOYMENT.md, LIVE_MODE.md
 tests/         unit, service and HTTP security tests
 ```
+
+## Meteora and Kamino Integration
+
+The Automated Liquidity Provision (ALP) system is designed to interact programmatically with Solana-based DeFi protocols through their published SDKs, on-chain programs, and Solana RPC infrastructure.
+
+The AI component provides market analysis and proposes liquidity-management decisions. A separate deterministic execution layer validates those decisions, enforces risk policies, constructs transactions, and submits approved operations.
+
+### 1. Protocols and Developer Tooling
+
+**Meteora DLMM**
+
+Meteora's Dynamic Liquidity Market Maker (DLMM) uses discrete liquidity bins to provide concentrated liquidity.
+
+Official TypeScript SDK:
+- Package: `@meteora-ag/dlmm`
+- Repository: https://github.com/MeteoraAg/dlmm-sdk
+- Documentation: https://docs.meteora.ag/
+
+Relevant documented SDK operations include:
+- `DLMM.create()` — initialize a pool client.
+- `getActiveBin()` — retrieve active-bin information.
+- `getBinsAroundActiveBin()` — inspect liquidity around the active bin.
+- `initializePositionAndAddLiquidityByStrategy()` — initialize a position and add liquidity.
+- `addLiquidityByStrategy()` — add liquidity to an existing position.
+- `removeLiquidity()` — remove liquidity from a position.
+
+Exact method signatures and parameters must be checked against the SDK version selected for implementation.
+
+**Kamino**
+
+Kamino provides distinct products that must be integrated according to their intended responsibilities.
+
+- Kamino Lending SDK: `@kamino-finance/klend-sdk`
+- Kamino Liquidity SDK: `@kamino-finance/kliquidity-sdk`
+- Lending SDK: https://github.com/Kamino-Finance/klend-sdk
+- Liquidity SDK: https://github.com/Kamino-Finance/kliquidity-sdk
+
+Kamino Lending can provide access to lending markets, reserves, deposits, and borrowing functionality.
+
+Kamino Liquidity provides automated concentrated-liquidity strategies across supported protocols.
+
+The ALP system must distinguish between lending capital and concentrated-liquidity positions. Integration with one product does not automatically manage positions in another.
+
+**Solana infrastructure**
+- `@solana/web3.js` for Solana connections and transaction infrastructure.
+- Anchor tooling where required by the selected program SDK.
+- A reliable RPC provider with HTTP and WebSocket support.
+
+### 2. Integration Architecture
+
+The system is divided into four logical responsibilities:
+
+1. **Market Intelligence:** Collects token prices, trading activity, liquidity depth, volatility, pool fees, and protocol state.
+2. **AI Strategy Engine:** Evaluates available opportunities and proposes capital allocation and liquidity-management decisions.
+3. **Risk and Policy Engine:** Validates token identity, liquidity, slippage, exposure limits, protocol health, and strategy constraints.
+4. **Execution and Signing:** Constructs, simulates, signs, submits, and monitors approved transactions.
+
+The AI model must not have direct access to private keys or unrestricted transaction-signing authority.
+
+### 3. Transaction Lifecycle
+
+A proposed liquidity operation follows this lifecycle:
+
+1. Collect current market and on-chain data.
+2. Generate a proposed strategy.
+3. Validate the proposal against deterministic risk policies.
+4. Calculate permitted amounts, price limits, and slippage constraints.
+5. Construct the protocol transaction using its official SDK.
+6. Simulate the transaction and inspect expected effects.
+7. Authorize and sign through an isolated signing boundary.
+8. Submit the transaction and monitor its confirmation.
+9. Reconcile the resulting on-chain state with internal accounting.
+
+Failed, expired, or partially completed operations must be handled explicitly. The system must never assume a transaction succeeded merely because submission returned a signature.
+
+### 4. Security and Execution Considerations
+
+**Key management:** Keep signing credentials isolated from the AI model. Apply transaction authorization, spending limits, key rotation, and emergency shutdown procedures.
+
+**RPC infrastructure:** Use reliable RPC infrastructure with appropriate rate limits, WebSocket subscriptions, retry policies, and fallback providers.
+
+**Slippage and execution:** Calculate slippage limits dynamically and enforce maximum permitted price impact. Reject transactions outside the configured risk limits.
+
+**MEV considerations:** Jito bundles can support sequential, atomic execution of multiple transactions. They may be useful for specific multi-step operations, but do not guarantee transaction inclusion or eliminate all execution risks.
+
+**Protocol verification:** Validate program IDs, SDK versions, supported instructions, account requirements, and transaction simulation results before enabling live execution.
+
+### 5. Integration Development Strategy
+
+Protocol integrations should be developed incrementally:
+
+- Begin with read-only pool and market-state collection.
+- Implement and test transaction construction on devnet or with controlled test environments.
+- Validate position accounting, deposits, withdrawals, and failure recovery.
+- Introduce strict risk limits before enabling funded execution.
+- Expand to automated capital movement only after the individual integrations have passed their security and operational tests.
+
+All protocol interactions must be independently testable and isolated behind application-level interfaces.

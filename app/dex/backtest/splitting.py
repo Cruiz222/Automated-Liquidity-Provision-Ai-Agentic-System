@@ -34,11 +34,30 @@ class HistoricalMarketDataSplit:
         if self.testing.pool_id != self.pool_id:
             raise DataSplitError("testing pool_id does not match split")
 
+        if self.training.chain != self.testing.chain:
+            raise DataSplitError("training and testing chains differ")
+
         if (
             self.training.token0.upper() != self.testing.token0.upper()
             or self.training.token1.upper() != self.testing.token1.upper()
         ):
             raise DataSplitError("training and testing token orientation differs")
+
+        training_addresses = self.training.token_addresses
+        testing_addresses = self.testing.token_addresses
+
+        if bool(training_addresses) != bool(testing_addresses):
+            raise DataSplitError(
+                "training and testing contract identity availability differs"
+            )
+
+        if (
+            training_addresses
+            and training_addresses != testing_addresses
+        ):
+            raise DataSplitError(
+                "training and testing token contract addresses differ"
+            )
 
         if not self.training.observations:
             raise DataSplitError("training period cannot be empty")
@@ -122,14 +141,18 @@ class ChronologicalMarketDataSplitter:
             pool_id=market_data.pool_id,
             token0=market_data.token0,
             token1=market_data.token1,
+            chain=market_data.chain,
             observations=training_points,
+            token_addresses=market_data.token_addresses,
         )
 
         testing = HistoricalMarketData(
             pool_id=market_data.pool_id,
             token0=market_data.token0,
             token1=market_data.token1,
+            chain=market_data.chain,
             observations=testing_points,
+            token_addresses=market_data.token_addresses,
         )
 
         return HistoricalMarketDataSplit(
