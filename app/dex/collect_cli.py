@@ -17,6 +17,7 @@ from typing import Any
 
 from .collector import PoolSnapshotCollector
 from .defillama import DefiLlamaPoolProvider, PoolUniverse
+from .meteora import MeteoraDLMMProvider, MeteoraUniverse
 from .provider import FixturePoolProvider
 from .snapshot_store import SnapshotStore
 
@@ -30,12 +31,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=("live", "fixture"),
         required=True,
-        help="live uses DefiLlama; fixture uses synthetic example data.",
+        help="live uses a selected public provider; fixture uses synthetic example data.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("defillama", "meteora"),
+        default="defillama",
+        help="Live data provider (default: defillama).",
     )
     parser.add_argument(
         "--database",
-        default="data/dex_snapshots.sqlite3",
-        help="Research database path (default: data/dex_snapshots.sqlite3).",
+        default=None,
+        help=(
+            "Research database path. If omitted, a separate default database "
+            "is selected for the provider or fixture mode."
+        ),
     )
     parser.add_argument(
         "--fixture-file",
@@ -57,8 +67,28 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Comma-separated live-data projects. Empty uses provider defaults.",
     )
-    parser.add_argument("--min-tvl", type=float, default=5_000_000.0)
+    parser.add_argument(
+        "--min-tvl",
+        type=float,
+        default=None,
+        help=(
+            "Minimum pool TVL in USD. Defaults to $5,000,000 for DefiLlama "
+            "and $100,000 for Meteora."
+        ),
+    )
     parser.add_argument("--max-pools", type=int, default=40)
+    parser.add_argument(
+        "--page-size", type=int, default=100,
+        help="Meteora API page size, from 1 to 1000 (default: 100).",
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=10,
+        help="Maximum Meteora pages to inspect (default: 10).",
+    )
+    parser.add_argument(
+        "--include-blacklisted", action="store_true",
+        help="Include Meteora pools marked as blacklisted (not recommended).",
+    )
     parser.add_argument(
         "--history-days",
         type=int,
@@ -105,9 +135,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_provider(args: argparse.Namespace) -> Any:
+def resolve_database_path(args: argparse.Namespace) -> Path:
+    """Resolve an explicit database path or the mode/provider default."""
+    if args.database is not None:
+        return Path(args.database).expanduser()
+
     if args.mode == "fixture":
+        return Path("data/fixture_snapshots.sqlite3")
+
+    if args.provider == "meteora":
+        return Path("data/meteora_snapshots.sqlite3")
+
+    return Path("data/defillama_snapshots.sqlite3")
+
+
+def resolve_min_tvl(args: argparse.Namespace) -> float:
+    """Resolve an explicit TVL threshold or the provider-specific default."""
+    if args.min_tvl is not None:
+        return args.min_tvl
+
+    if args.mode == "live" and args.provider == "meteora":
+        return 100_000.0
+
+    return 5_000_000.0
+
+
+def build_provider(args: argparse.Namespace) -> Any:
+    min_tvl = resolve_min_tvl(args)
+
+    if args.mode == "fixture":
+        if args.provider != "defillama":
+            raise ValueError("--provider can only be used with --mode live.")
         return FixturePoolProvider(args.fixture_file)
+
+    if args.provider == "meteora":
+        universe = MeteoraUniverse(
+            min_tvl_usd=min_tvl,
+            max_pools=args.max_pools,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+            include_blacklisted=args.include_blacklisted,
+        )
+        return MeteoraDLMMProvider(universe)
 
     defaults = PoolUniverse()
 
@@ -118,7 +187,7 @@ def build_provider(args: argparse.Namespace) -> Any:
         chains=chains or defaults.chains,
         projects=projects or defaults.projects,
         tokens=defaults.tokens,
-        min_tvl_usd=args.min_tvl,
+        min_tvl_usd=min_tvl,
         max_pools=args.max_pools,
         history_days=args.history_days,
         history_period=args.history_period,
@@ -145,6 +214,7 @@ def persist_result(db: sqlite3.Connection, result: Any, provider: Any = None) ->
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    args.min_tvl = resolve_min_tvl(args)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -159,6 +229,14 @@ def main() -> int:
         parser.error("--cycles can only be used together with --watch.")
     if args.min_tvl < 0:
         parser.error("--min-tvl cannot be negative.")
+    if args.mode == "fixture" and args.provider != "defillama":
+        parser.error("--provider can only be used with --mode live.")
+    if args.mode == "live" and args.provider == "meteora" and args.min_tvl <= 0:
+        parser.error("--min-tvl must be greater than zero for Meteora.")
+    if args.page_size < 1 or args.page_size > 1000:
+        parser.error("--page-size must be between 1 and 1000.")
+    if args.max_pages < 1:
+        parser.error("--max-pages must be at least 1.")
     if args.max_pools < 1:
         parser.error("--max-pools must be at least 1.")
     if args.history_days < 1:
@@ -172,7 +250,7 @@ def main() -> int:
     if args.keep_per_pool < 1:
         parser.error("--keep-per-pool must be at least 1.")
 
-    database_path = Path(args.database).expanduser()
+    database_path = resolve_database_path(args)
     if str(database_path) == ":memory:":
         parser.error("Use a file path for --database; the collector is intended to persist observations.")
 
@@ -201,7 +279,7 @@ def main() -> int:
 
         print(f"Mode: {args.mode}", flush=True)
         print(f"Research database: {database_path}", flush=True)
-        if args.mode == "live":
+        if args.mode == "live" and args.provider == "defillama":
             universe = provider.universe
             print(
                 f"Price history: period={universe.history_period}, "
@@ -209,12 +287,24 @@ def main() -> int:
                 f"alignment_tolerance={universe.effective_alignment_tolerance_seconds}s",
                 flush=True,
             )
-        print(
-            "Data warning: fixture mode contains synthetic observations."
-            if args.mode == "fixture"
-            else "Data source: public DefiLlama APIs; read-only collection.",
-            flush=True,
-        )
+        elif args.mode == "live" and args.provider == "meteora":
+            universe = provider.universe
+            print(
+                "Meteora discovery: "
+                f"min_tvl_usd={universe.min_tvl_usd}, "
+                f"max_pools={universe.max_pools}, "
+                f"page_size={universe.page_size}, "
+                f"max_pages={universe.max_pages}, "
+                f"include_blacklisted={universe.include_blacklisted}",
+                flush=True,
+            )
+
+        if args.mode == "fixture":
+            print("Data warning: fixture mode contains synthetic observations.", flush=True)
+        elif args.provider == "meteora":
+            print("Data source: public Meteora DLMM API; read-only collection.", flush=True)
+        else:
+            print("Data source: public DefiLlama APIs; read-only collection.", flush=True)
 
         if args.watch:
             print(

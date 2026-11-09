@@ -173,12 +173,19 @@ class HistoricalMarketDataLoader:
         token0 = first.token0
         token1 = first.token1
         chain = normalize_chain(first.chain)
+        source_label = first.source
 
         observations: dict[float, float] = {}
         known_addresses: tuple[str, str] | None = None
         missing_addresses_seen = False
 
         for snapshot in snapshots:
+            if snapshot.source != source_label:
+                raise ValueError(
+                    f"inconsistent data source for pool: {pool_id} "
+                    f"({source_label!r} vs {snapshot.source!r})"
+                )
+
             if normalize_chain(snapshot.chain) != chain:
                 raise ValueError(
                     f"inconsistent chain identity for pool: {pool_id}"

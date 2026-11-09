@@ -35,7 +35,9 @@ class TestDEXExperimentRunner(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def make_snapshot(self, *, as_of, observations, fee_apr=0.10):
+    def make_snapshot(
+        self, *, as_of, observations, fee_apr=0.10, source="test"
+    ):
         return PoolSnapshot(
             pool_id="USDC-USDT",
             chain="base",
@@ -50,7 +52,7 @@ class TestDEXExperimentRunner(unittest.TestCase):
             price0_usd=1.0,
             price1_usd=1.0,
             as_of=as_of,
-            source="test",
+            source=source,
         )
 
     def create_snapshot_database(self):
@@ -114,6 +116,10 @@ class TestDEXExperimentRunner(unittest.TestCase):
 
         report = json.loads(report_path.read_text("utf-8"))
         self.assertEqual(report["manifest"]["study_type"], "dex_lp")
+        self.assertEqual(
+            report["manifest"]["snapshot_database"]["source"],
+            "test",
+        )
         self.assertEqual(report["experiment"]["id"], result["id"])
         self.assertIn("selected_pool_count", report["result"])
 
@@ -126,6 +132,54 @@ class TestDEXExperimentRunner(unittest.TestCase):
         registered = read_runs(self.registry_path, result["id"])
         self.assertEqual(registered["status"], "completed")
         self.assertEqual(registered["study_type"], "dex_lp")
+
+    def test_mixed_source_database_is_rejected(self):
+        db = sqlite3.connect(self.snapshot_path)
+        try:
+            store = SnapshotStore(
+                db,
+                threading.RLock(),
+                keep_per_pool=None,
+            )
+            store.save(
+                self.make_snapshot(
+                    as_of=CUTOFF + 2 * DAY,
+                    observations=[(CUTOFF + 2 * DAY, 1.0006)],
+                    source="another-provider",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with self.assertRaisesRegex(
+            DEXExperimentError,
+            "exactly one data source",
+        ):
+            self.run_experiment()
+
+    def test_sqlite_snapshot_metadata_mismatch_is_rejected(self):
+        db = sqlite3.connect(self.snapshot_path)
+        try:
+            db.execute(
+                """
+                UPDATE pool_snapshots
+                SET source = ?
+                WHERE snapshot_id = (
+                    SELECT MIN(snapshot_id) FROM pool_snapshots
+                )
+                """,
+                ("tampered-provider",),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with self.assertRaisesRegex(
+            DEXExperimentError,
+            "metadata does not match",
+        ):
+            self.run_experiment()
 
     def test_second_call_reuses_verified_result(self):
         first = self.run_experiment()

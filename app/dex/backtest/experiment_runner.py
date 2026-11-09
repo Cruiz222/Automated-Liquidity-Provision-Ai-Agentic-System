@@ -35,7 +35,7 @@ IMPLEMENTATION_FILES = (
 )
 
 DEFAULT_OUTPUT_DIR = Path("data/dex_experiments")
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 
 class DEXExperimentError(ValueError):
@@ -181,20 +181,53 @@ def _validate_snapshot_database(path: Path) -> dict[str, Any]:
             # verifies the JSON shape and PoolSnapshot domain invariants.
             from app.dex.pool_data import PoolSnapshot
 
+            sources: set[str] = set()
+
             for row in db.execute(
-                "SELECT payload_json FROM pool_snapshots ORDER BY snapshot_id"
+                """
+                SELECT snapshot_id, pool_id, as_of, source, payload_json
+                FROM pool_snapshots
+                ORDER BY snapshot_id
+                """
             ):
                 try:
                     payload = json.loads(row["payload_json"])
-                    PoolSnapshot.from_dict(payload)
+                    snapshot = PoolSnapshot.from_dict(payload)
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise DEXExperimentError(
                         f"Invalid stored pool snapshot: {exc}"
                     ) from exc
 
+                if (
+                    row["pool_id"] != snapshot.pool_id
+                    or row["as_of"] != snapshot.as_of
+                    or row["source"] != snapshot.source
+                ):
+                    raise DEXExperimentError(
+                        "Snapshot SQLite metadata does not match its "
+                        f"serialized payload (snapshot_id={row['snapshot_id']})"
+                    )
+
+                if (
+                    not isinstance(snapshot.source, str)
+                    or not snapshot.source.strip()
+                ):
+                    raise DEXExperimentError(
+                        "Snapshot source must be a non-empty string"
+                    )
+
+                sources.add(snapshot.source)
+
+            if len(sources) != 1:
+                raise DEXExperimentError(
+                    "Snapshot database must contain exactly one data source; "
+                    f"found: {sorted(sources)}"
+                )
+
             return {
                 "snapshot_count": count,
                 "schema_columns": sorted(columns),
+                "source": next(iter(sources)),
             }
         finally:
             db.close()
@@ -240,6 +273,7 @@ def _build_manifest(
             "filename": snapshot_path.name,
             "sha256": snapshot_sha256,
             "snapshot_count": snapshot_info["snapshot_count"],
+            "source": snapshot_info["source"],
         },
         "cutoff_timestamp": cutoff_timestamp,
         "capital_micro_usdt": capital_micro_usdt,

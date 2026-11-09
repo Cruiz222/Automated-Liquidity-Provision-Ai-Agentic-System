@@ -12,7 +12,12 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlsplit
 
-ALLOWED_HOSTS = frozenset({"yields.llama.fi", "coins.llama.fi", "api.coingecko.com"})
+ALLOWED_HOSTS = frozenset({"yields.llama.fi",
+                           "coins.llama.fi",
+                           "api.coingecko.com",
+                           "dlmm.datapi.meteora.ag",
+                           })
+
 MAX_BYTES = 80_000_000          # the full DefiLlama pool list is tens of megabytes
 
 

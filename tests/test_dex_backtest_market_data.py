@@ -25,6 +25,7 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
         token1="USDT",
         token_addresses=(),
         chain="ethereum",
+        source="test",
     ):
         return PoolSnapshot(
             pool_id="pool-1",
@@ -36,7 +37,7 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
             tvl_usd=100_000,
             price_observations=tuple(observations),
             as_of=as_of,
-            source="test",
+            source=source,
         )
 
     def save(self, snapshot):
@@ -59,6 +60,21 @@ class TestHistoricalMarketDataLoader(unittest.TestCase):
             [(p.timestamp, p.price) for p in result.observations],
             [(10, 3000), (20, 3100), (30, 3200)],
         )
+
+    def test_rejects_mixed_sources_for_one_pool(self):
+        self.save(self.make_snapshot(
+            100,
+            [(10, 3000)],
+            source="provider-a",
+        ))
+        self.save(self.make_snapshot(
+            200,
+            [(20, 3100)],
+            source="provider-b",
+        ))
+
+        with self.assertRaisesRegex(ValueError, "inconsistent data source"):
+            self.loader.load_pool("pool-1")
 
     def test_observations_are_chronologically_sorted(self):
         self.save(self.make_snapshot(
