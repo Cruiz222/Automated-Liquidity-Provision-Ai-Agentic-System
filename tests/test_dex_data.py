@@ -1,4 +1,5 @@
 import dataclasses
+import sqlite3
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +39,71 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertEqual(self.store.latest(self.base.pool_id).tvl_usd, 1.0e8)
         self.assertEqual(len(self.store.latest_all()), 1)
         self.assertIsNone(self.store.latest("nope"))
+
+    def test_failed_retention_cleanup_rolls_back_new_snapshot(self):
+        store = SnapshotStore(
+            self.ledger.db,
+            self.ledger.lock,
+            keep_per_pool=1,
+        )
+
+        original = dataclasses.replace(
+            self.base,
+            as_of=self.base.as_of + 10,
+        )
+        newer = dataclasses.replace(
+            self.base,
+            as_of=self.base.as_of + 20,
+        )
+
+        store.save(original)
+
+        # Force retention cleanup to fail when it tries to delete
+        # the older snapshot after inserting the newer one.
+        with self.ledger.lock:
+            self.ledger.db.execute(
+                """
+                CREATE TRIGGER fail_snapshot_retention
+                BEFORE DELETE ON pool_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated retention failure');
+                END;
+                """
+            )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.save(newer)
+
+        history = store.history_snapshots(self.base.pool_id)
+
+        # The failed insertion must not remain in the database.
+        self.assertEqual(
+            [snapshot.as_of for snapshot in history],
+            [original.as_of],
+        )
+
+        # A failed standalone save must not leak an open transaction.
+        self.assertFalse(self.ledger.db.in_transaction)
+
+        with self.ledger.lock:
+            self.ledger.db.execute(
+                "DROP TRIGGER fail_snapshot_retention"
+            )
+
+    def test_save_preserves_caller_owned_transaction(self):
+        snapshot = dataclasses.replace(
+            self.base,
+            as_of=self.base.as_of + 100,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "force outer rollback"):
+            with self.ledger.transaction():
+                self.assertTrue(self.store.save(snapshot))
+                self.assertTrue(self.ledger.db.in_transaction)
+                raise RuntimeError("force outer rollback")
+
+        self.assertFalse(self.ledger.db.in_transaction)
+        self.assertIsNone(self.store.latest(self.base.pool_id))
 
     def test_history_is_pruned(self):
         for i in range(6):

@@ -1,5 +1,12 @@
+import contextlib
+import io
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import app.dex.collect_cli as collect_cli
 
 from app.dex.collect_cli import (
     build_parser,
@@ -119,6 +126,65 @@ class CollectCLIProviderTests(unittest.TestCase):
         args = build_parser().parse_args(["--mode", "fixture"])
 
         self.assertIsInstance(build_provider(args), FixturePoolProvider)
+
+
+class CollectCLIWatchModeTests(unittest.TestCase):
+    def run_watch(self, outcomes, interrupt=False):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "watch.sqlite3"
+
+            def fake_collect_forever(
+                collector,
+                interval_seconds,
+                max_cycles,
+                on_result,
+            ):
+                for outcome in outcomes:
+                    result = type(
+                        "FakeResult",
+                        (),
+                        {
+                            "ok": outcome,
+                            "to_dict": lambda self, value=outcome: {
+                                "ok": value
+                            },
+                        },
+                    )()
+                    on_result(result)
+
+                if interrupt:
+                    raise KeyboardInterrupt
+
+            with (
+                patch.object(
+                    collect_cli.PoolSnapshotCollector,
+                    "collect_forever",
+                    fake_collect_forever,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "collect_cli",
+                        "--mode", "fixture",
+                        "--database", str(database),
+                        "--watch",
+                        "--cycles", str(len(outcomes)),
+                        "--interval", "1",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                return collect_cli.main()
+
+    def test_watch_returns_zero_when_all_cycles_succeed(self):
+        self.assertEqual(self.run_watch([True, True]), 0)
+
+    def test_watch_returns_one_when_any_cycle_fails(self):
+        self.assertEqual(self.run_watch([False, True]), 1)
+
+    def test_watch_preserves_failure_status_after_keyboard_interrupt(self):
+        self.assertEqual(self.run_watch([False], interrupt=True), 1)
 
 
 if __name__ == "__main__":

@@ -312,15 +312,26 @@ def main() -> int:
                 f"cycles={args.cycles or 'until interrupted'}",
                 flush=True,
             )
+
+            had_failures = False
+
+            def persist_watch_result(result: Any) -> None:
+                nonlocal had_failures
+
+                persist_result(db, result, provider)
+                if not result.ok:
+                    had_failures = True
+
             try:
                 collector.collect_forever(
                     interval_seconds=args.interval,
                     max_cycles=args.cycles,
-                    on_result=lambda result: persist_result(db, result, provider),
+                    on_result=persist_watch_result,
                 )
             except KeyboardInterrupt:
                 print("\nCollection stopped by user.", flush=True)
-            return 0
+
+            return 1 if had_failures else 0
 
         result = collector.collect_once()
         persist_result(db, result, provider)

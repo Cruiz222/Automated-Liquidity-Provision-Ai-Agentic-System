@@ -65,79 +65,107 @@ class SnapshotStore:
         )
 
     def save(self, snapshot: PoolSnapshot) -> bool:
-        """Save a snapshot.
+        """Save a snapshot atomically with its retention cleanup.
 
         Returns True when inserted and False for an identical duplicate.
         Raises ValueError if the same unique key has different content.
+
+        A transaction started here is committed or rolled back here.
+        An existing caller-owned transaction is preserved through a savepoint.
         """
         payload = self._serialize(snapshot)
 
         with self.lock:
-            cursor = self.db.execute(
-                """
-                INSERT OR IGNORE INTO pool_snapshots
-                    (pool_id, as_of, source, payload_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    snapshot.pool_id,
-                    snapshot.as_of,
-                    snapshot.source,
-                    payload,
-                ),
-            )
+            owns_transaction = not self.db.in_transaction
 
-            inserted = cursor.rowcount == 1
+            if owns_transaction:
+                self.db.execute("BEGIN")
 
-            if not inserted:
-                existing = self.db.execute(
+            savepoint_created = False
+
+            try:
+                self.db.execute("SAVEPOINT save_snapshot")
+                savepoint_created = True
+
+                cursor = self.db.execute(
                     """
-                    SELECT payload_json
-                    FROM pool_snapshots
-                    WHERE pool_id = ? AND as_of = ? AND source = ?
+                    INSERT OR IGNORE INTO pool_snapshots
+                        (pool_id, as_of, source, payload_json)
+                    VALUES (?, ?, ?, ?)
                     """,
                     (
                         snapshot.pool_id,
                         snapshot.as_of,
                         snapshot.source,
-                    ),
-                ).fetchone()
-
-                if existing is None:
-                    raise RuntimeError(
-                        "Snapshot insert was ignored, but the existing "
-                        "record could not be found"
-                    )
-
-                if existing[0] != payload:
-                    raise ValueError(
-                        "Conflicting snapshot: pool_id, as_of and source "
-                        "already exist with different content"
-                    )
-
-                return False
-
-            if self.keep_per_pool is not None:
-                self.db.execute(
-                    """
-                    DELETE FROM pool_snapshots
-                    WHERE pool_id = ?
-                      AND snapshot_id NOT IN (
-                          SELECT snapshot_id
-                          FROM pool_snapshots
-                          WHERE pool_id = ?
-                          ORDER BY snapshot_id DESC
-                          LIMIT ?
-                      )
-                    """,
-                    (
-                        snapshot.pool_id,
-                        snapshot.pool_id,
-                        self.keep_per_pool,
+                        payload,
                     ),
                 )
 
-            return True
+                inserted = cursor.rowcount == 1
+
+                if not inserted:
+                    existing = self.db.execute(
+                        """
+                        SELECT payload_json
+                        FROM pool_snapshots
+                        WHERE pool_id = ? AND as_of = ? AND source = ?
+                        """,
+                        (
+                            snapshot.pool_id,
+                            snapshot.as_of,
+                            snapshot.source,
+                        ),
+                    ).fetchone()
+
+                    if existing is None:
+                        raise RuntimeError(
+                            "Snapshot insert was ignored, but the existing "
+                            "record could not be found"
+                        )
+
+                    if existing[0] != payload:
+                        raise ValueError(
+                            "Conflicting snapshot: pool_id, as_of and source "
+                            "already exist with different content"
+                        )
+
+                if inserted and self.keep_per_pool is not None:
+                    self.db.execute(
+                        """
+                        DELETE FROM pool_snapshots
+                        WHERE pool_id = ?
+                          AND snapshot_id NOT IN (
+                              SELECT snapshot_id
+                              FROM pool_snapshots
+                              WHERE pool_id = ?
+                              ORDER BY snapshot_id DESC
+                              LIMIT ?
+                          )
+                        """,
+                        (
+                            snapshot.pool_id,
+                            snapshot.pool_id,
+                            self.keep_per_pool,
+                        ),
+                    )
+
+                self.db.execute("RELEASE SAVEPOINT save_snapshot")
+                savepoint_created = False
+
+                if owns_transaction:
+                    self.db.execute("COMMIT")
+
+                return inserted
+
+            except BaseException:
+                if savepoint_created:
+                    self.db.execute("ROLLBACK TO SAVEPOINT save_snapshot")
+                    self.db.execute("RELEASE SAVEPOINT save_snapshot")
+
+                if owns_transaction and self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+
+                raise
 
     def latest(self, pool_id: str) -> PoolSnapshot | None:
         with self.lock:
