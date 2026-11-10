@@ -550,6 +550,55 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
                     ((float(collection_time), 85.0),),
                 )
 
+    def test_handles_unaligned_history_window_boundaries(self):
+        interval = 3600
+        start_time = int(NOW) - 86400 + 704
+        end_time = int(NOW) + 704
+
+        def fetch(url):
+            query = parse_qs(urlparse(url).query)
+            chunk_start = int(query["start_time"][0])
+            chunk_end = int(query["end_time"][0])
+
+            first_candle = (chunk_start // interval) * interval
+            last_candle = (chunk_end // interval) * interval
+
+            return {
+                "timeframe": "1h",
+                "data": [
+                    {
+                        "timestamp": timestamp,
+                        "close": float(timestamp),
+                    }
+                    for timestamp in range(
+                        first_candle,
+                        last_candle + 1,
+                        interval,
+                    )
+                ],
+            }
+
+        provider = self.provider(fetch)
+
+        observations = provider._fetch_price_history(
+            POOL_A,
+            start_time,
+            end_time,
+        )
+
+        timestamps = [timestamp for timestamp, _ in observations]
+
+        self.assertEqual(len(observations), 24)
+        self.assertTrue(all(start_time < ts <= end_time for ts in timestamps))
+        self.assertEqual(
+            timestamps[0],
+            float((start_time // interval) * interval + interval),
+        )
+        self.assertEqual(
+            timestamps[-1],
+            float((end_time // interval) * interval),
+        )
+
     def test_chunked_history_covers_window_and_deduplicates_boundary(self):
         interval = 3600
         start_time = int(NOW) - (4 * 86400)

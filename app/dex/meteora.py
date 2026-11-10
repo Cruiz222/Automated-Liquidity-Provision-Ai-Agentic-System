@@ -182,7 +182,9 @@ class MeteoraDLMMProvider:
         both endpoints. Identical boundary observations are deduplicated.
 
         Candle timestamps identify candle starts. Stored observations
-        use candle-close timestamps.
+        use candle-close timestamps. The first request is aligned down
+        to the candle boundary so the candle containing start_time is
+        available for close-time filtering.
         """
         timeframe = self.universe.history_timeframe
         interval = TIMEFRAME_SECONDS[timeframe]
@@ -193,7 +195,9 @@ class MeteoraDLMMProvider:
         # Keyed by candle-open timestamp to detect boundary duplicates.
         closes_by_timestamp: dict[int, float] = {}
 
-        chunk_start = start_time
+        # Meteora may return the candle containing the requested start.
+        # Align down so that candle is inside the first request.
+        chunk_start = (start_time // interval) * interval
 
         while chunk_start < end_time:
             chunk_end = min(
@@ -291,6 +295,13 @@ class MeteoraDLMMProvider:
 
                 previous_timestamp = timestamp
 
+                # Include only completed candles whose close falls
+                # inside the original requested history window.
+                candle_close_timestamp = timestamp + interval
+
+                if not start_time < candle_close_timestamp <= end_time:
+                    continue
+
                 existing_close = closes_by_timestamp.get(int(timestamp))
 
                 if existing_close is not None:
@@ -299,13 +310,6 @@ class MeteoraDLMMProvider:
                             f"Conflicting OHLCV close for duplicate "
                             f"timestamp {int(timestamp)} in pool {pool_id}"
                         )
-                    continue
-
-                # A candle close is usable only after the overall
-                # collection end, not merely the current chunk boundary.
-                candle_close_timestamp = timestamp + interval
-
-                if candle_close_timestamp > end_time:
                     continue
 
                 closes_by_timestamp[int(timestamp)] = close
