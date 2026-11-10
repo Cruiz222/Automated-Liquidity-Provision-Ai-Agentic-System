@@ -454,6 +454,7 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
                 return {
                     "timeframe": "1h",
                     "data": [
+                        {"timestamp": NOW - 7200, "close": 84.0},
                         {"timestamp": NOW - 3600, "close": 85.0},
                         {"timestamp": NOW, "close": 86.0},
                     ],
@@ -477,14 +478,67 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
         )
         self.assertEqual(history_query["end_time"], [str(int(NOW))])
 
-        self.assertEqual(pool.price_history, (85.0, 86.0))
+        # The first two candles have closed. The candle starting at NOW
+        # is still forming and must not enter historical observations.
+        self.assertEqual(pool.price_history, (84.0, 85.0))
         self.assertEqual(
             pool.price_observations,
             (
-                (NOW - 3600, 85.0),
-                (NOW, 86.0),
+                (NOW - 3600, 84.0),
+                (NOW, 85.0),
             ),
         )
+
+    def test_converts_candle_timestamps_for_every_supported_timeframe(self):
+        timeframe_seconds = {
+            "5m": 300,
+            "30m": 1800,
+            "1h": 3600,
+            "2h": 7200,
+            "4h": 14400,
+            "12h": 43200,
+            "24h": 86400,
+        }
+
+        for timeframe, duration in timeframe_seconds.items():
+            with self.subTest(timeframe=timeframe):
+                collection_time = duration * 100
+
+                def fetch(url):
+                    if "/ohlcv?" in url:
+                        return {
+                            "timeframe": timeframe,
+                            "data": [
+                                {
+                                    "timestamp": collection_time - duration,
+                                    "close": 85.0,
+                                },
+                                {
+                                    "timestamp": collection_time,
+                                    "close": 86.0,
+                                },
+                            ],
+                        }
+
+                    return response([meteora_pool()])
+
+                provider = MeteoraDLMMProvider(
+                    universe=MeteoraUniverse(
+                        history_days=1,
+                        history_timeframe=timeframe,
+                    ),
+                    fetch=fetch,
+                    clock=lambda: collection_time,
+                )
+
+                pool = provider.fetch_pools()[0]
+
+                # The completed candle is timestamped at its close.
+                # The candle starting at collection_time is incomplete.
+                self.assertEqual(
+                    pool.price_observations,
+                    ((float(collection_time), 85.0),),
+                )
 
     def test_empty_ohlcv_history_preserves_discovered_pool(self):
         def fetch(url):
@@ -538,6 +592,7 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
             [None],
             [{"close": 85.0}],
             [{"timestamp": float("nan"), "close": 85.0}],
+            [{"timestamp": NOW - 3600.5, "close": 85.0}],
             [{"timestamp": NOW, "close": float("nan")}],
             [{"timestamp": NOW, "close": 0}],
             [{"timestamp": NOW, "close": -1}],
