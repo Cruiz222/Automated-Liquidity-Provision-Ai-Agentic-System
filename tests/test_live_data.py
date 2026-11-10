@@ -494,6 +494,168 @@ class TestSafeFetch(unittest.TestCase):
             dexhttp._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil.example/")
 
 
+    def http_error(self, status: int, headers=None):
+        return dexhttp.urllib.error.HTTPError(
+            "https://yields.llama.fi/pools",
+            status,
+            "HTTP test error",
+            headers or {},
+            None,
+        )
+
+    def test_retries_503_then_returns_success(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            self.http_error(503),
+            self.fake_response(b'{"ok": true}').open.return_value,
+        ]
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            result = fetch_json(
+                "https://yields.llama.fi/pools",
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(sleeps, [0.5])
+
+    def test_429_respects_retry_after_header(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            self.http_error(429, {"Retry-After": "2"}),
+            self.fake_response(b'{"ok": true}').open.return_value,
+        ]
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            result = fetch_json(
+                "https://yields.llama.fi/pools",
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(sleeps, [2.0])
+
+    def test_retry_after_is_capped_at_maximum_backoff(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            self.http_error(503, {"Retry-After": "60"}),
+            self.fake_response(b'{"ok": true}').open.return_value,
+        ]
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            fetch_json(
+                "https://yields.llama.fi/pools",
+                max_backoff_seconds=3,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(sleeps, [3.0])
+
+    def test_exhausted_http_retries_raise_provider_error(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            self.http_error(503),
+            self.http_error(503),
+            self.http_error(503),
+        ]
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(ProviderError, "HTTP 503 after 3 attempts"):
+                fetch_json(
+                    "https://yields.llama.fi/pools",
+                    sleep=sleeps.append,
+                )
+
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_permanent_http_error_is_not_retried(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = self.http_error(400)
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(ProviderError, "HTTP 400"):
+                fetch_json(
+                    "https://yields.llama.fi/pools",
+                    sleep=sleeps.append,
+                )
+
+        self.assertEqual(opener.open.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_network_timeout_retries_then_recovers(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            TimeoutError("request timed out"),
+            self.fake_response(b'{"recovered": true}').open.return_value,
+        ]
+        sleeps = []
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            result = fetch_json(
+                "https://yields.llama.fi/pools",
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(result, {"recovered": True})
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(sleeps, [0.5])
+
+    def test_invalid_json_is_not_retried(self):
+        opener = self.fake_response(b"not json")
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(ProviderError, "invalid JSON"):
+                fetch_json("https://yields.llama.fi/pools")
+
+        self.assertEqual(opener.open.call_count, 1)
+
+
+    def test_http_date_retry_after_is_respected(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            self.http_error(503, {"Retry-After": "Tue, 10 Nov 2026 15:00:02 GMT"}),
+            self.fake_response(b'{"ok": true}').open.return_value,
+        ]
+        sleeps = []
+        fixed_now = dexhttp.datetime(
+            2026, 11, 10, 15, 0, 0,
+            tzinfo=dexhttp.timezone.utc,
+        )
+
+        with mock.patch.object(dexhttp.urllib.request, "build_opener", return_value=opener):
+            result = fetch_json(
+                "https://yields.llama.fi/pools",
+                sleep=sleeps.append,
+                clock=lambda: fixed_now,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(opener.open.call_count, 2)
+
+    def test_invalid_backoff_settings_are_rejected(self):
+        invalid_values = (-1, float("nan"), float("inf"), "0.5", True)
+
+        for value in invalid_values:
+            for parameter in ("backoff_seconds", "max_backoff_seconds"):
+                with self.subTest(parameter=parameter, value=value):
+                    with mock.patch.object(dexhttp.urllib.request, "build_opener") as build_opener:
+                        with self.assertRaises(ValueError):
+                            fetch_json(
+                                "https://yields.llama.fi/pools",
+                                **{parameter: value},
+                            )
+                        build_opener.assert_not_called()
+
+
 class TestSelectorOnLiveShapedData(unittest.TestCase):
     def snapshot(self, **kw):
         base = dict(pool_id="p", chain="arbitrum", dex="uniswap-v2", token0="WETH", token1="USDC", tvl_usd=60e6, fee_tier_bps=30,
