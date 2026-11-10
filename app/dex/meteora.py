@@ -408,7 +408,10 @@ class MeteoraDLMMProvider:
         seen: set[str] = set()
 
         report: dict[str, Any] = {
+            "pages_reported_by_api": None,
             "pages_requested": 0,
+            "pages_processed": 0,
+            "pages_not_retrieved": None,
             "pools_examined": 0,
             "pools_accepted": 0,
             "excluded": {
@@ -419,18 +422,24 @@ class MeteoraDLMMProvider:
                 "duplicate": 0,
             },
             "truncated_by_max_pages": False,
+            "truncated_by_max_pools": False,
         }
+
+        # Publish this run's report immediately. A failed run must not leave
+        # a previous successful report looking current.
+        self.last_report = report
 
         total_pages: int | None = None
         total_pools: int | None = None
+        stop_reason: str | None = None
 
         for page in range(1, self.universe.max_pages + 1):
             params = urlencode({
                 "page": page,
                 "page_size": self.universe.page_size,
             })
-            payload = self._fetch(f"{POOLS_URL}?{params}")
             report["pages_requested"] += 1
+            payload = self._fetch(f"{POOLS_URL}?{params}")
 
             if not isinstance(payload, dict):
                 raise ProviderError("Meteora response must be an object")
@@ -486,6 +495,12 @@ class MeteoraDLMMProvider:
             if page > pages:
                 raise ProviderError("Meteora returned a page beyond its reported page count")
 
+            report["pages_reported_by_api"] = total_pages
+            report["pages_processed"] += 1
+            report["pages_not_retrieved"] = max(
+                total_pages - report["pages_processed"],
+                0,
+            )
             report["pools_examined"] += len(rows)
 
             for record in rows:
@@ -528,9 +543,11 @@ class MeteoraDLMMProvider:
                     break
 
             if len(accepted) >= self.universe.max_pools:
+                stop_reason = "max_pools"
                 break
 
             if page >= pages:
+                stop_reason = "api_final_page"
                 break
 
             if not rows:
@@ -539,13 +556,24 @@ class MeteoraDLMMProvider:
                 )
 
         else:
-            report["truncated_by_max_pages"] = (
-                total_pages is not None
-                and self.universe.max_pages < total_pages
+            stop_reason = "max_pages"
+
+        if total_pages is not None:
+            report["pages_not_retrieved"] = max(
+                total_pages - report["pages_processed"],
+                0,
             )
+
+        report["truncated_by_max_pages"] = (
+            stop_reason == "max_pages"
+            and report["pages_not_retrieved"] > 0
+        )
+        report["truncated_by_max_pools"] = (
+            stop_reason == "max_pools"
+            and report["pages_not_retrieved"] > 0
+        )
 
         report["pools_accepted"] = len(accepted)
         accepted = self._enrich_history(accepted, now, report)
-        self.last_report = report
 
         return accepted

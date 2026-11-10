@@ -346,18 +346,25 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
                 pages=3,
             )
 
-        pools = self.provider(
+        provider = self.provider(
             fetch,
             max_pools=2,
             page_size=1,
             max_pages=10,
-        ).fetch_pools()
+        )
+        pools = provider.fetch_pools()
 
         self.assertEqual(
             [pool.pool_id for pool in pools],
             ["PoolOne", "PoolTwo"],
         )
         self.assertEqual(calls, [1, 2])
+        self.assertEqual(provider.last_report["pages_reported_by_api"], 3)
+        self.assertEqual(provider.last_report["pages_requested"], 2)
+        self.assertEqual(provider.last_report["pages_processed"], 2)
+        self.assertEqual(provider.last_report["pages_not_retrieved"], 1)
+        self.assertFalse(provider.last_report["truncated_by_max_pages"])
+        self.assertTrue(provider.last_report["truncated_by_max_pools"])
 
     def test_never_requests_more_than_max_pages(self):
         calls = []
@@ -378,16 +385,23 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
                 pages=100,
             )
 
-        pools = self.provider(
+        provider = self.provider(
             fetch,
             min_tvl_usd=100_000,
             max_pools=100,
             page_size=1,
             max_pages=3,
-        ).fetch_pools()
+        )
+        pools = provider.fetch_pools()
 
         self.assertEqual(len(pools), 3)
         self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(provider.last_report["pages_reported_by_api"], 100)
+        self.assertEqual(provider.last_report["pages_requested"], 3)
+        self.assertEqual(provider.last_report["pages_processed"], 3)
+        self.assertEqual(provider.last_report["pages_not_retrieved"], 97)
+        self.assertTrue(provider.last_report["truncated_by_max_pages"])
+        self.assertFalse(provider.last_report["truncated_by_max_pools"])
 
     def test_rejects_non_progressing_pagination(self):
         calls = []
@@ -413,12 +427,18 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
 
-    def test_propagates_provider_errors(self):
+    def test_propagates_provider_errors_and_reports_failed_request_attempt(self):
         def fetch(url):
             raise ProviderError("Meteora API unavailable")
 
+        provider = self.provider(fetch)
         with self.assertRaises(ProviderError):
-            self.provider(fetch).fetch_pools()
+            provider.fetch_pools()
+
+        self.assertEqual(provider.last_report["pages_requested"], 1)
+        self.assertEqual(provider.last_report["pages_processed"], 0)
+        self.assertIsNone(provider.last_report["pages_reported_by_api"])
+        self.assertIsNone(provider.last_report["pages_not_retrieved"])
 
     def test_report_records_discovery_counts(self):
         records = [
@@ -440,8 +460,13 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
         provider.fetch_pools()
 
         self.assertIsInstance(provider.last_report, dict)
+        self.assertEqual(provider.last_report["pages_reported_by_api"], 1)
         self.assertEqual(provider.last_report["pages_requested"], 1)
+        self.assertEqual(provider.last_report["pages_processed"], 1)
+        self.assertEqual(provider.last_report["pages_not_retrieved"], 0)
         self.assertEqual(provider.last_report["pools_accepted"], 1)
+        self.assertFalse(provider.last_report["truncated_by_max_pages"])
+        self.assertFalse(provider.last_report["truncated_by_max_pools"])
 
 
     def test_enriches_pool_with_timestamped_ohlcv_closes(self):
