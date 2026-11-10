@@ -17,6 +17,16 @@ POOLS_URL = "https://dlmm.datapi.meteora.ag/pools"
 OHLCV_URL = f"{POOLS_URL}/{{address}}/ohlcv"
 SUPPORTED_TIMEFRAMES = frozenset({"5m", "30m", "1h", "2h", "4h", "12h", "24h"})
 
+TIMEFRAME_SECONDS = {
+    "5m": 5 * 60,
+    "30m": 30 * 60,
+    "1h": 60 * 60,
+    "2h": 2 * 60 * 60,
+    "4h": 4 * 60 * 60,
+    "12h": 12 * 60 * 60,
+    "24h": 24 * 60 * 60,
+}
+
 
 def _finite(value: Any) -> bool:
     return (
@@ -162,8 +172,13 @@ class MeteoraDLMMProvider:
     ) -> tuple[tuple[float, float], ...]:
         """Fetch and validate OHLCV close prices for one pool.
 
-        Meteora OHLCV close is retained in the pool's token0/token1
-        orientation. Do not reverse the pair here.
+        Meteora timestamps identify candle start times, while close
+        prices represent the end of each candle period. Store the close
+        price at its candle-close timestamp, and exclude candles that
+        had not closed by the collection time.
+
+        Prices remain in the pool's token0/token1 orientation. Do not
+        reverse the pair here.
         """
         query = urlencode(
             {
@@ -229,6 +244,11 @@ class MeteoraDLMMProvider:
             timestamp = float(timestamp)
             close = float(close)
 
+            if not timestamp.is_integer():
+                raise ProviderError(
+                    f"OHLCV timestamp must be an integer Unix second for {pool_id}"
+                )
+
             if timestamp < start_time or timestamp > end_time:
                 raise ProviderError(
                     f"OHLCV timestamp outside requested range for {pool_id}"
@@ -242,8 +262,17 @@ class MeteoraDLMMProvider:
                     f"OHLCV timestamps are not strictly increasing for {pool_id}"
                 )
 
-            observations.append((timestamp, close))
             previous_timestamp = timestamp
+
+            candle_close_timestamp = (
+                timestamp + TIMEFRAME_SECONDS[self.universe.history_timeframe]
+            )
+
+            # A candle's close is not knowable until its period has ended.
+            if candle_close_timestamp > end_time:
+                continue
+
+            observations.append((candle_close_timestamp, close))
 
         return tuple(observations)
 
