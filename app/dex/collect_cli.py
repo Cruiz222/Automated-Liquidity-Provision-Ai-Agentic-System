@@ -109,6 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--meteora-timeframe",
+        choices=("5m", "30m", "1h", "2h", "4h", "12h", "24h"),
+        default="1h",
+        help="Meteora OHLCV historical candle timeframe (default: 1h).",
+    )
+
+    parser.add_argument(
         "--watch",
         action="store_true",
         help="Keep collecting repeatedly instead of collecting once.",
@@ -175,6 +182,8 @@ def build_provider(args: argparse.Namespace) -> Any:
             page_size=args.page_size,
             max_pages=args.max_pages,
             include_blacklisted=args.include_blacklisted,
+            history_days=args.history_days,
+            history_timeframe=args.meteora_timeframe,
         )
         return MeteoraDLMMProvider(universe)
 
@@ -295,7 +304,9 @@ def main() -> int:
                 f"max_pools={universe.max_pools}, "
                 f"page_size={universe.page_size}, "
                 f"max_pages={universe.max_pages}, "
-                f"include_blacklisted={universe.include_blacklisted}",
+                f"include_blacklisted={universe.include_blacklisted}, "
+                f"history_days={universe.history_days}, "
+                f"history_timeframe={universe.history_timeframe}",
                 flush=True,
             )
 

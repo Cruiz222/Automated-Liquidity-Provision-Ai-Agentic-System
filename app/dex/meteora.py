@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import urlencode
 
@@ -13,6 +14,8 @@ from .pool_data import PoolSnapshot
 
 
 POOLS_URL = "https://dlmm.datapi.meteora.ag/pools"
+OHLCV_URL = f"{POOLS_URL}/{{address}}/ohlcv"
+SUPPORTED_TIMEFRAMES = frozenset({"5m", "30m", "1h", "2h", "4h", "12h", "24h"})
 
 
 def _finite(value: Any) -> bool:
@@ -32,6 +35,8 @@ class MeteoraUniverse:
     page_size: int = 100
     max_pages: int = 10
     include_blacklisted: bool = False
+    history_days: int = 30
+    history_timeframe: str = "1h"
 
     def __post_init__(self) -> None:
         if (
@@ -63,6 +68,17 @@ class MeteoraUniverse:
 
         if not isinstance(self.include_blacklisted, bool):
             raise ValueError("include_blacklisted must be a boolean")
+        if (
+            isinstance(self.history_days, bool)
+            or not isinstance(self.history_days, int)
+            or self.history_days < 1
+        ):
+            raise ValueError("history_days must be a positive integer")
+
+        if self.history_timeframe not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"history_timeframe must be one of {sorted(SUPPORTED_TIMEFRAMES)}"
+            )
 
 
 class MeteoraDLMMProvider:
@@ -137,6 +153,171 @@ class MeteoraDLMMProvider:
             )
         except (TypeError, ValueError):
             return None
+
+    def _fetch_price_history(
+        self,
+        pool_id: str,
+        start_time: int,
+        end_time: int,
+    ) -> tuple[tuple[float, float], ...]:
+        """Fetch and validate OHLCV close prices for one pool.
+
+        Meteora OHLCV close is retained in the pool's token0/token1
+        orientation. Do not reverse the pair here.
+        """
+        query = urlencode(
+            {
+                "timeframe": self.universe.history_timeframe,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
+        url = f"{OHLCV_URL.format(address=pool_id)}?{query}"
+
+        try:
+            payload = self._fetch(url)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Meteora OHLCV request failed for pool {pool_id}: {exc}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise ProviderError(
+                f"Meteora OHLCV response for {pool_id} must be an object"
+            )
+
+        echoed_timeframe = payload.get("timeframe")
+        if (
+            echoed_timeframe is not None
+            and echoed_timeframe != self.universe.history_timeframe
+        ):
+            raise ProviderError(
+                f"Meteora returned unexpected timeframe for {pool_id}: "
+                f"{echoed_timeframe!r}"
+            )
+
+        candles = payload.get("data")
+        if not isinstance(candles, list):
+            raise ProviderError(
+                f"Meteora OHLCV data for {pool_id} must be a list"
+            )
+
+        observations: list[tuple[float, float]] = []
+        previous_timestamp: float | None = None
+
+        for index, candle in enumerate(candles):
+            if not isinstance(candle, dict):
+                raise ProviderError(
+                    f"Invalid OHLCV candle {index} for pool {pool_id}"
+                )
+
+            timestamp = candle.get("timestamp")
+            close = candle.get("close")
+
+            if not _finite(timestamp) or timestamp < 0:
+                raise ProviderError(
+                    f"Invalid OHLCV timestamp at index {index} for {pool_id}"
+                )
+
+            if not _finite(close) or close <= 0:
+                raise ProviderError(
+                    f"Invalid OHLCV close at index {index} for {pool_id}"
+                )
+
+            timestamp = float(timestamp)
+            close = float(close)
+
+            if timestamp < start_time or timestamp > end_time:
+                raise ProviderError(
+                    f"OHLCV timestamp outside requested range for {pool_id}"
+                )
+
+            if (
+                previous_timestamp is not None
+                and timestamp <= previous_timestamp
+            ):
+                raise ProviderError(
+                    f"OHLCV timestamps are not strictly increasing for {pool_id}"
+                )
+
+            observations.append((timestamp, close))
+            previous_timestamp = timestamp
+
+        return tuple(observations)
+
+    def _enrich_history(
+        self,
+        pools: list[PoolSnapshot],
+        now: float,
+        report: dict[str, Any],
+    ) -> list[PoolSnapshot]:
+        """Attach historical OHLCV close observations to discovered pools."""
+        end_time = int(now)
+        start_time = end_time - self.universe.history_days * 86400
+
+        history_report: dict[str, Any] = {
+            "timeframe": self.universe.history_timeframe,
+            "requested_days": self.universe.history_days,
+            "requests": 0,
+            "pools_with_history": 0,
+            "pools_without_history": 0,
+            "observations_total": 0,
+            "observations_min": 0,
+            "observations_median": 0,
+            "observations_max": 0,
+            "failures": [],
+        }
+
+        enriched: list[PoolSnapshot] = []
+        observation_counts: list[int] = []
+
+        for pool in pools:
+            history_report["requests"] += 1
+
+            try:
+                observations = self._fetch_price_history(
+                    pool.pool_id,
+                    start_time,
+                    end_time,
+                )
+            except ProviderError as exc:
+                history_report["pools_without_history"] += 1
+                history_report["failures"].append(
+                    {"pool_id": pool.pool_id, "error": str(exc)}
+                )
+                enriched.append(pool)
+                continue
+
+            if not observations:
+                history_report["pools_without_history"] += 1
+                enriched.append(pool)
+                continue
+
+            closes = tuple(price for _, price in observations)
+
+            enriched.append(
+                replace(
+                    pool,
+                    price_history=closes,
+                    price_observations=observations,
+                )
+            )
+
+            history_report["pools_with_history"] += 1
+            history_report["observations_total"] += len(observations)
+            observation_counts.append(len(observations))
+
+        if observation_counts:
+            history_report["observations_min"] = min(observation_counts)
+            history_report["observations_median"] = statistics.median(
+                observation_counts
+            )
+            history_report["observations_max"] = max(observation_counts)
+
+        report["history"] = history_report
+        return enriched
 
     def fetch_pools(self) -> list[PoolSnapshot]:
         now = self._clock()
@@ -281,6 +462,7 @@ class MeteoraDLMMProvider:
             )
 
         report["pools_accepted"] = len(accepted)
+        accepted = self._enrich_history(accepted, now, report)
         self.last_report = report
 
         return accepted
