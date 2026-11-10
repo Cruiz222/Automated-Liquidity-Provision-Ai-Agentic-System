@@ -17,6 +17,11 @@ POOLS_URL = "https://dlmm.datapi.meteora.ag/pools"
 OHLCV_URL = f"{POOLS_URL}/{{address}}/ohlcv"
 SUPPORTED_TIMEFRAMES = frozenset({"5m", "30m", "1h", "2h", "4h", "12h", "24h"})
 
+# Meteora accepts approximately 100 candles per OHLCV request.
+# Use 90 intervals to leave a safety margin with inclusive endpoints.
+MAX_CANDLE_INTERVALS_PER_REQUEST = 90
+
+
 TIMEFRAME_SECONDS = {
     "5m": 5 * 60,
     "30m": 30 * 60,
@@ -169,112 +174,155 @@ class MeteoraDLMMProvider:
         pool_id: str,
         start_time: int,
         end_time: int,
+        on_request: Callable[[], None] | None = None,
     ) -> tuple[tuple[float, float], ...]:
-        """Fetch and validate OHLCV close prices for one pool.
+        """Fetch and validate chunked OHLCV close-price history.
 
-        Meteora timestamps identify candle start times, while close
-        prices represent the end of each candle period. Store the close
-        price at its candle-close timestamp, and exclude candles that
-        had not closed by the collection time.
+        Requests overlap at their boundaries because Meteora includes
+        both endpoints. Identical boundary observations are deduplicated.
 
-        Prices remain in the pool's token0/token1 orientation. Do not
-        reverse the pair here.
+        Candle timestamps identify candle starts. Stored observations
+        use candle-close timestamps.
         """
-        query = urlencode(
-            {
-                "timeframe": self.universe.history_timeframe,
-                "start_time": start_time,
-                "end_time": end_time,
-            }
+        timeframe = self.universe.history_timeframe
+        interval = TIMEFRAME_SECONDS[timeframe]
+        max_chunk_seconds = (
+            MAX_CANDLE_INTERVALS_PER_REQUEST * interval
         )
-        url = f"{OHLCV_URL.format(address=pool_id)}?{query}"
 
-        try:
-            payload = self._fetch(url)
-        except ProviderError:
-            raise
-        except Exception as exc:
-            raise ProviderError(
-                f"Meteora OHLCV request failed for pool {pool_id}: {exc}"
-            ) from exc
+        # Keyed by candle-open timestamp to detect boundary duplicates.
+        closes_by_timestamp: dict[int, float] = {}
 
-        if not isinstance(payload, dict):
-            raise ProviderError(
-                f"Meteora OHLCV response for {pool_id} must be an object"
+        chunk_start = start_time
+
+        while chunk_start < end_time:
+            chunk_end = min(
+                chunk_start + max_chunk_seconds,
+                end_time,
             )
 
-        echoed_timeframe = payload.get("timeframe")
-        if (
-            echoed_timeframe is not None
-            and echoed_timeframe != self.universe.history_timeframe
-        ):
-            raise ProviderError(
-                f"Meteora returned unexpected timeframe for {pool_id}: "
-                f"{echoed_timeframe!r}"
-            )
+            query = urlencode({
+                "timeframe": timeframe,
+                "start_time": chunk_start,
+                "end_time": chunk_end,
+            })
 
-        candles = payload.get("data")
-        if not isinstance(candles, list):
-            raise ProviderError(
-                f"Meteora OHLCV data for {pool_id} must be a list"
-            )
+            url = f"{OHLCV_URL.format(address=pool_id)}?{query}"
 
-        observations: list[tuple[float, float]] = []
-        previous_timestamp: float | None = None
+            if on_request is not None:
+                on_request()
 
-        for index, candle in enumerate(candles):
-            if not isinstance(candle, dict):
+            try:
+                payload = self._fetch(url)
+            except ProviderError:
+                raise
+            except Exception as exc:
                 raise ProviderError(
-                    f"Invalid OHLCV candle {index} for pool {pool_id}"
+                    f"Meteora OHLCV request failed for pool {pool_id}: {exc}"
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise ProviderError(
+                    f"Meteora OHLCV response for {pool_id} must be an object"
                 )
 
-            timestamp = candle.get("timestamp")
-            close = candle.get("close")
-
-            if not _finite(timestamp) or timestamp < 0:
-                raise ProviderError(
-                    f"Invalid OHLCV timestamp at index {index} for {pool_id}"
-                )
-
-            if not _finite(close) or close <= 0:
-                raise ProviderError(
-                    f"Invalid OHLCV close at index {index} for {pool_id}"
-                )
-
-            timestamp = float(timestamp)
-            close = float(close)
-
-            if not timestamp.is_integer():
-                raise ProviderError(
-                    f"OHLCV timestamp must be an integer Unix second for {pool_id}"
-                )
-
-            if timestamp < start_time or timestamp > end_time:
-                raise ProviderError(
-                    f"OHLCV timestamp outside requested range for {pool_id}"
-                )
-
+            echoed_timeframe = payload.get("timeframe")
             if (
-                previous_timestamp is not None
-                and timestamp <= previous_timestamp
+                echoed_timeframe is not None
+                and echoed_timeframe != timeframe
             ):
                 raise ProviderError(
-                    f"OHLCV timestamps are not strictly increasing for {pool_id}"
+                    f"Meteora returned unexpected timeframe for {pool_id}: "
+                    f"{echoed_timeframe!r}"
                 )
 
-            previous_timestamp = timestamp
+            candles = payload.get("data")
+            if not isinstance(candles, list):
+                raise ProviderError(
+                    f"Meteora OHLCV data for {pool_id} must be a list"
+                )
 
-            candle_close_timestamp = (
-                timestamp + TIMEFRAME_SECONDS[self.universe.history_timeframe]
+            previous_timestamp: float | None = None
+
+            for index, candle in enumerate(candles):
+                if not isinstance(candle, dict):
+                    raise ProviderError(
+                        f"Invalid OHLCV candle {index} for pool {pool_id}"
+                    )
+
+                timestamp = candle.get("timestamp")
+                close = candle.get("close")
+
+                if not _finite(timestamp) or timestamp < 0:
+                    raise ProviderError(
+                        f"Invalid OHLCV timestamp at index {index} "
+                        f"for {pool_id}"
+                    )
+
+                if not _finite(close) or close <= 0:
+                    raise ProviderError(
+                        f"Invalid OHLCV close at index {index} "
+                        f"for {pool_id}"
+                    )
+
+                timestamp = float(timestamp)
+                close = float(close)
+
+                if not timestamp.is_integer():
+                    raise ProviderError(
+                        f"OHLCV timestamp must be an integer Unix second "
+                        f"for {pool_id}"
+                    )
+
+                if timestamp < chunk_start or timestamp > chunk_end:
+                    raise ProviderError(
+                        f"OHLCV timestamp outside requested chunk "
+                        f"for {pool_id}"
+                    )
+
+                if (
+                    previous_timestamp is not None
+                    and timestamp <= previous_timestamp
+                ):
+                    raise ProviderError(
+                        f"OHLCV timestamps are not strictly increasing "
+                        f"for {pool_id}"
+                    )
+
+                previous_timestamp = timestamp
+
+                existing_close = closes_by_timestamp.get(int(timestamp))
+
+                if existing_close is not None:
+                    if existing_close != close:
+                        raise ProviderError(
+                            f"Conflicting OHLCV close for duplicate "
+                            f"timestamp {int(timestamp)} in pool {pool_id}"
+                        )
+                    continue
+
+                # A candle close is usable only after the overall
+                # collection end, not merely the current chunk boundary.
+                candle_close_timestamp = timestamp + interval
+
+                if candle_close_timestamp > end_time:
+                    continue
+
+                closes_by_timestamp[int(timestamp)] = close
+
+            if chunk_end == end_time:
+                break
+
+            # Deliberately overlap one boundary candle.
+            chunk_start = chunk_end
+
+        return tuple(
+            (
+                float(timestamp + interval),
+                closes_by_timestamp[timestamp],
             )
-
-            # A candle's close is not knowable until its period has ended.
-            if candle_close_timestamp > end_time:
-                continue
-
-            observations.append((candle_close_timestamp, close))
-
-        return tuple(observations)
+            for timestamp in sorted(closes_by_timestamp)
+        )
 
     def _enrich_history(
         self,
@@ -302,14 +350,16 @@ class MeteoraDLMMProvider:
         enriched: list[PoolSnapshot] = []
         observation_counts: list[int] = []
 
-        for pool in pools:
+        def record_request() -> None:
             history_report["requests"] += 1
 
+        for pool in pools:
             try:
                 observations = self._fetch_price_history(
                     pool.pool_id,
                     start_time,
                     end_time,
+                    on_request=record_request,
                 )
             except ProviderError as exc:
                 history_report["pools_without_history"] += 1

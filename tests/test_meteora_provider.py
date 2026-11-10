@@ -506,17 +506,27 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
 
                 def fetch(url):
                     if "/ohlcv?" in url:
+                        query = parse_qs(urlparse(url).query)
+                        chunk_start = int(query["start_time"][0])
+                        chunk_end = int(query["end_time"][0])
+
+                        candles = [
+                            {
+                                "timestamp": collection_time - duration,
+                                "close": 85.0,
+                            },
+                            {
+                                "timestamp": collection_time,
+                                "close": 86.0,
+                            },
+                        ]
+
                         return {
                             "timeframe": timeframe,
                             "data": [
-                                {
-                                    "timestamp": collection_time - duration,
-                                    "close": 85.0,
-                                },
-                                {
-                                    "timestamp": collection_time,
-                                    "close": 86.0,
-                                },
+                                candle
+                                for candle in candles
+                                if chunk_start <= candle["timestamp"] <= chunk_end
                             ],
                         }
 
@@ -556,7 +566,8 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
         self.assertEqual(pools[0].price_observations, ())
 
         history = provider.last_report["history"]
-        self.assertEqual(history["requests"], 1)
+        # Thirty days of hourly history requires eight 90-interval chunks.
+        self.assertEqual(history["requests"], 8)
         self.assertEqual(history["pools_with_history"], 0)
         self.assertEqual(history["pools_without_history"], 1)
         self.assertEqual(history["failures"], [])
