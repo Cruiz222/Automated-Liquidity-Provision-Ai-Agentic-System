@@ -550,6 +550,207 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
                     ((float(collection_time), 85.0),),
                 )
 
+    def test_chunked_history_covers_window_and_deduplicates_boundary(self):
+        interval = 3600
+        start_time = int(NOW) - (4 * 86400)
+        end_time = int(NOW)
+        requests = []
+
+        def fetch(url):
+            if "/ohlcv?" not in url:
+                return response([meteora_pool()])
+
+            query = parse_qs(urlparse(url).query)
+            chunk_start = int(query["start_time"][0])
+            chunk_end = int(query["end_time"][0])
+
+            requests.append((chunk_start, chunk_end))
+
+            return {
+                "timeframe": "1h",
+                "data": [
+                    {
+                        "timestamp": timestamp,
+                        "close": float(timestamp),
+                    }
+                    for timestamp in range(
+                        chunk_start,
+                        chunk_end + 1,
+                        interval,
+                    )
+                ],
+            }
+
+        provider = self.provider(
+            fetch,
+            history_days=4,
+            history_timeframe="1h",
+        )
+
+        pool = provider.fetch_pools()[0]
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0][0], start_time)
+        self.assertEqual(requests[0][1], requests[1][0])
+        self.assertEqual(requests[1][1], end_time)
+
+        for chunk_start, chunk_end in requests:
+            self.assertLessEqual(
+                (chunk_end - chunk_start) // interval,
+                90,
+            )
+
+        # 96 completed hourly candles; the candle beginning at NOW
+        # is incomplete and must be excluded.
+        self.assertEqual(len(pool.price_observations), 96)
+
+        timestamps = [
+            timestamp
+            for timestamp, _ in pool.price_observations
+        ]
+
+        self.assertEqual(len(timestamps), len(set(timestamps)))
+        self.assertEqual(
+            timestamps[0],
+            float(start_time + interval),
+        )
+        self.assertEqual(timestamps[-1], float(end_time))
+
+        history = provider.last_report["history"]
+        self.assertEqual(history["requests"], 2)
+        self.assertEqual(history["pools_with_history"], 1)
+
+    def test_rejects_conflicting_duplicate_candle_across_chunks(self):
+        interval = 3600
+        start_time = int(NOW) - (4 * 86400)
+        end_time = int(NOW)
+        boundary = start_time + (90 * interval)
+        request_count = 0
+
+        def fetch(url):
+            nonlocal request_count
+
+            if "/ohlcv?" not in url:
+                return response([meteora_pool()])
+
+            request_count += 1
+
+            if request_count == 1:
+                return {
+                    "timeframe": "1h",
+                    "data": [
+                        {"timestamp": boundary, "close": 10.0},
+                    ],
+                }
+
+            return {
+                "timeframe": "1h",
+                "data": [
+                    {"timestamp": boundary, "close": 11.0},
+                ],
+            }
+
+        provider = self.provider(
+            fetch,
+            history_days=4,
+            history_timeframe="1h",
+        )
+
+        with self.assertRaisesRegex(
+            ProviderError,
+            "Conflicting OHLCV close",
+        ):
+            provider._fetch_price_history(
+                POOL_A,
+                start_time,
+                end_time,
+            )
+
+        self.assertEqual(request_count, 2)
+
+    def test_failed_later_chunk_does_not_accept_partial_history(self):
+        request_count = 0
+        start_time = int(NOW) - (4 * 86400)
+
+        def fetch(url):
+            nonlocal request_count
+
+            if "/ohlcv?" not in url:
+                return response([meteora_pool()])
+
+            request_count += 1
+
+            if request_count == 1:
+                return {
+                    "timeframe": "1h",
+                    "data": [
+                        {"timestamp": start_time, "close": 10.0},
+                    ],
+                }
+
+            raise ProviderError("Second chunk unavailable")
+
+        provider = self.provider(
+            fetch,
+            history_days=4,
+            history_timeframe="1h",
+        )
+
+        pools = provider.fetch_pools()
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].pool_id, POOL_A)
+
+        # Partial observations from the first chunk must not be accepted.
+        self.assertEqual(pools[0].price_history, ())
+        self.assertEqual(pools[0].price_observations, ())
+
+        history = provider.last_report["history"]
+        self.assertEqual(history["requests"], 2)
+        self.assertEqual(history["pools_with_history"], 0)
+        self.assertEqual(history["pools_without_history"], 1)
+        self.assertEqual(len(history["failures"]), 1)
+        self.assertIn(
+            "Second chunk unavailable",
+            history["failures"][0]["error"],
+        )
+
+    def test_request_counter_includes_failed_chunk_attempts(self):
+        request_count = 0
+        start_time = int(NOW) - (4 * 86400)
+
+        def fetch(url):
+            nonlocal request_count
+
+            if "/ohlcv?" not in url:
+                return response([meteora_pool()])
+
+            request_count += 1
+
+            if request_count == 2:
+                raise ProviderError("Chunk request failed")
+
+            return {
+                "timeframe": "1h",
+                "data": [
+                    {"timestamp": start_time, "close": 10.0},
+                ],
+            }
+
+        provider = self.provider(
+            fetch,
+            history_days=4,
+            history_timeframe="1h",
+        )
+
+        provider.fetch_pools()
+
+        self.assertEqual(request_count, 2)
+        self.assertEqual(
+            provider.last_report["history"]["requests"],
+            2,
+        )
+
     def test_empty_ohlcv_history_preserves_discovered_pool(self):
         def fetch(url):
             if "/ohlcv?" in url:
