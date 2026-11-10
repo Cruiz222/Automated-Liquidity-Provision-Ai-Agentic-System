@@ -69,6 +69,19 @@ class TestMeteoraUniverse(unittest.TestCase):
             MeteoraUniverse(max_pages=0)
 
 
+    def test_rejects_non_positive_history_days(self):
+        for value in (0, -1):
+            with self.subTest(history_days=value):
+                with self.assertRaises(ValueError):
+                    MeteoraUniverse(history_days=value)
+
+    def test_rejects_invalid_history_timeframe(self):
+        for value in ("", "15m", "1d", "invalid"):
+            with self.subTest(history_timeframe=value):
+                with self.assertRaises(ValueError):
+                    MeteoraUniverse(history_timeframe=value)
+
+
 class TestMeteoraDLMMProvider(unittest.TestCase):
 
     def provider(self, fetch, **universe_options):
@@ -429,6 +442,161 @@ class TestMeteoraDLMMProvider(unittest.TestCase):
         self.assertIsInstance(provider.last_report, dict)
         self.assertEqual(provider.last_report["pages_requested"], 1)
         self.assertEqual(provider.last_report["pools_accepted"], 1)
+
+
+    def test_enriches_pool_with_timestamped_ohlcv_closes(self):
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+
+            if "/ohlcv?" in url:
+                return {
+                    "timeframe": "1h",
+                    "data": [
+                        {"timestamp": NOW - 3600, "close": 85.0},
+                        {"timestamp": NOW, "close": 86.0},
+                    ],
+                }
+
+            return response([meteora_pool()])
+
+        pool = self.provider(
+            fetch,
+            history_days=1,
+            history_timeframe="1h",
+        ).fetch_pools()[0]
+
+        self.assertEqual(len(calls), 2)
+
+        history_query = parse_qs(urlparse(calls[1]).query)
+        self.assertEqual(history_query["timeframe"], ["1h"])
+        self.assertEqual(
+            history_query["start_time"],
+            [str(int(NOW) - 86400)],
+        )
+        self.assertEqual(history_query["end_time"], [str(int(NOW))])
+
+        self.assertEqual(pool.price_history, (85.0, 86.0))
+        self.assertEqual(
+            pool.price_observations,
+            (
+                (NOW - 3600, 85.0),
+                (NOW, 86.0),
+            ),
+        )
+
+    def test_empty_ohlcv_history_preserves_discovered_pool(self):
+        def fetch(url):
+            if "/ohlcv?" in url:
+                return {"timeframe": "1h", "data": []}
+
+            return response([meteora_pool()])
+
+        provider = self.provider(fetch)
+        pools = provider.fetch_pools()
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].pool_id, POOL_A)
+        self.assertEqual(pools[0].price_history, ())
+        self.assertEqual(pools[0].price_observations, ())
+
+        history = provider.last_report["history"]
+        self.assertEqual(history["requests"], 1)
+        self.assertEqual(history["pools_with_history"], 0)
+        self.assertEqual(history["pools_without_history"], 1)
+        self.assertEqual(history["failures"], [])
+
+    def test_ohlcv_request_failure_preserves_discovered_pool(self):
+        def fetch(url):
+            if "/ohlcv?" in url:
+                raise ProviderError("OHLCV endpoint unavailable")
+
+            return response([meteora_pool()])
+
+        provider = self.provider(fetch)
+        pools = provider.fetch_pools()
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].pool_id, POOL_A)
+        self.assertEqual(pools[0].price_observations, ())
+
+        history = provider.last_report["history"]
+        self.assertEqual(history["pools_with_history"], 0)
+        self.assertEqual(history["pools_without_history"], 1)
+        self.assertEqual(len(history["failures"]), 1)
+        self.assertEqual(history["failures"][0]["pool_id"], POOL_A)
+        self.assertIn(
+            "OHLCV endpoint unavailable",
+            history["failures"][0]["error"],
+        )
+
+    def test_rejects_malformed_ohlcv_candles_without_losing_pool(self):
+        valid = {"timestamp": NOW - 3600, "close": 85.0}
+
+        invalid_histories = [
+            [None],
+            [{"close": 85.0}],
+            [{"timestamp": float("nan"), "close": 85.0}],
+            [{"timestamp": NOW, "close": float("nan")}],
+            [{"timestamp": NOW, "close": 0}],
+            [{"timestamp": NOW, "close": -1}],
+            [{"timestamp": NOW + 1, "close": 85.0}],
+            [
+                {"timestamp": NOW, "close": 85.0},
+                {"timestamp": NOW, "close": 86.0},
+            ],
+            [
+                {"timestamp": NOW, "close": 85.0},
+                {"timestamp": NOW - 3600, "close": 86.0},
+            ],
+        ]
+
+        for candles in invalid_histories:
+            with self.subTest(candles=candles):
+                def fetch(url):
+                    if "/ohlcv?" in url:
+                        return {"timeframe": "1h", "data": candles}
+
+                    return response([meteora_pool()])
+
+                provider = self.provider(fetch)
+                pools = provider.fetch_pools()
+
+                self.assertEqual(len(pools), 1)
+                self.assertEqual(pools[0].pool_id, POOL_A)
+                self.assertEqual(pools[0].price_observations, ())
+                self.assertEqual(
+                    provider.last_report["history"]["pools_without_history"],
+                    1,
+                )
+                self.assertEqual(
+                    len(provider.last_report["history"]["failures"]),
+                    1,
+                )
+
+    def test_rejects_ohlcv_timeframe_mismatch(self):
+        def fetch(url):
+            if "/ohlcv?" in url:
+                return {
+                    "timeframe": "1d",
+                    "data": [{"timestamp": NOW, "close": 85.0}],
+                }
+
+            return response([meteora_pool()])
+
+        provider = self.provider(
+            fetch,
+            history_timeframe="1h",
+        )
+        pools = provider.fetch_pools()
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].price_observations, ())
+        self.assertEqual(
+            len(provider.last_report["history"]["failures"]),
+            1,
+        )
 
 
 if __name__ == "__main__":

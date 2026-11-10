@@ -43,6 +43,8 @@ class CollectCLIProviderTests(unittest.TestCase):
             "--page-size", "50",
             "--max-pages", "4",
             "--include-blacklisted",
+            "--history-days", "14",
+            "--meteora-timeframe", "5m",
         ])
 
         provider = build_provider(args)
@@ -52,6 +54,33 @@ class CollectCLIProviderTests(unittest.TestCase):
         self.assertEqual(provider.universe.page_size, 50)
         self.assertEqual(provider.universe.max_pages, 4)
         self.assertTrue(provider.universe.include_blacklisted)
+        self.assertEqual(provider.universe.history_days, 14)
+        self.assertEqual(provider.universe.history_timeframe, "5m")
+
+    def test_meteora_timeframe_defaults_to_one_hour(self):
+        args = build_parser().parse_args([
+            "--mode", "live",
+            "--provider", "meteora",
+        ])
+
+        self.assertEqual(args.meteora_timeframe, "1h")
+        self.assertEqual(
+            build_provider(args).universe.history_timeframe,
+            "1h",
+        )
+
+    def test_meteora_timeframe_does_not_change_defillama_configuration(self):
+        args = build_parser().parse_args([
+            "--mode", "live",
+            "--provider", "defillama",
+            "--meteora-timeframe", "5m",
+        ])
+
+        provider = build_provider(args)
+
+        self.assertIsInstance(provider, DefiLlamaPoolProvider)
+        self.assertEqual(provider.universe.history_period, "1d")
+        self.assertEqual(provider.universe.history_days, 30)
 
     def test_defillama_default_min_tvl(self):
         args = build_parser().parse_args(["--mode", "live"])
