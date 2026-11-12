@@ -461,6 +461,78 @@ class TestDefiLlamaProvider(unittest.TestCase):
         self.assertGreaterEqual(len(price_calls), 2)
         self.assertTrue(all(len(unquote(c.split("current/")[1]).split(",")) <= 30 for c in price_calls))
 
+    def test_current_price_report_counts_each_rejection_reason(self):
+        ids = [
+            "arbitrum:" + WETH,
+            "arbitrum:" + USDC,
+            "base:" + USDC,
+            "base:" + USDT_B,
+        ]
+
+        def fetch(url):
+            if url.startswith(CURRENT_URL.split("{")[0]):
+                return {
+                    "coins": {
+                        "arbitrum:" + WETH: {
+                            "price": 3000.0,
+                            "timestamp": NOW,
+                            "confidence": 0.99,
+                        },
+                        "arbitrum:" + USDC: {
+                            "price": -1.0,
+                            "timestamp": NOW,
+                            "confidence": 0.99,
+                        },
+                        "base:" + USDC: {
+                            "price": 1.0,
+                            "timestamp": NOW - 3600,
+                            "confidence": 0.99,
+                        },
+                    }
+                }
+            raise AssertionError(url)
+
+        provider = DefiLlamaPoolProvider(
+            PoolUniverse(),
+            fetch,
+            clock=lambda: NOW,
+        )
+
+        prices = provider._current_prices(ids)
+        report = provider._current_price_report
+
+        self.assertEqual(len(prices), 1)
+        self.assertEqual(report["requested_coins"], 4)
+        self.assertEqual(report["requests"], 1)
+        self.assertEqual(report["returned_records"], 3)
+        self.assertEqual(report["accepted_quotes"], 1)
+        self.assertEqual(report["missing_records"], 1)
+        self.assertEqual(report["rejected_quotes"], 2)
+        self.assertEqual(
+            report["rejection_reasons"],
+            {
+                "invalid_price": 1,
+                "stale_quote": 1,
+            },
+        )
+
+    def test_current_price_report_distinguishes_failed_requests(self):
+        provider = self.provider(fail_prices=True)
+
+        prices = provider._current_prices([
+            "arbitrum:" + WETH,
+            "arbitrum:" + USDC,
+        ])
+        report = provider._current_price_report
+
+        self.assertEqual(prices, {})
+        self.assertEqual(report["requested_coins"], 2)
+        self.assertEqual(report["requests"], 1)
+        self.assertEqual(report["failed_requests"], 1)
+        self.assertEqual(report["missing_records"], 0)
+        self.assertEqual(report["rejected_quotes"], 0)
+        self.assertEqual(report["unresolved_due_to_request_failure"], 2)
+
 
 class TestSafeFetch(unittest.TestCase):
     def fake_response(self, body: bytes):
@@ -775,11 +847,18 @@ class PricedProvider:
     def fetch_pools(self):
         out = []
         for s in load_snapshots(EXAMPLE)[0]:
+            stamp = self.clock()
             if s.pool_id == "weth-usdc-arbitrum-5bp":
-                s = dataclasses.replace(s, price0_usd=self.p0, price1_usd=self.p1)
+                s = dataclasses.replace(
+                    s, price0_usd=self.p0, price1_usd=self.p1,
+                    price0_as_of=stamp, price1_as_of=stamp,
+                )
             elif s.pool_id == "usdc-usdt-arbitrum-1bp":
-                s = dataclasses.replace(s, price0_usd=1.0, price1_usd=1.0)
-            out.append(dataclasses.replace(s, as_of=self.clock()))
+                s = dataclasses.replace(
+                    s, price0_usd=1.0, price1_usd=1.0,
+                    price0_as_of=stamp, price1_as_of=stamp,
+                )
+            out.append(dataclasses.replace(s, as_of=stamp))
         return out
 
 
@@ -855,7 +934,7 @@ class TestPaperValuation(unittest.TestCase):
 class TestFeedCheck(unittest.TestCase):
     def test_report_lists_counts_pools_and_rates(self):
         lines = []
-        provider = DefiLlamaPoolProvider(PoolUniverse(), make_fetch(), clock=time.time)
+        provider = DefiLlamaPoolProvider(PoolUniverse(), make_fetch(), clock=lambda: NOW)
         rates = build_rate_service(["coingecko-tether-ngn"], fetch=lambda u, t=5.0: {"tether": {"ngn": 1500}})
         status = feedcheck.run_check(provider, rates, out=lines.append)
         text = "\n".join(lines)

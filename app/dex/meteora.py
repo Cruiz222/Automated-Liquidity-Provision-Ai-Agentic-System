@@ -353,6 +353,9 @@ class MeteoraDLMMProvider:
 
         enriched: list[PoolSnapshot] = []
         observation_counts: list[int] = []
+        history_interval_seconds = TIMEFRAME_SECONDS[
+            self.universe.history_timeframe
+        ]
 
         def record_request() -> None:
             history_report["requests"] += 1
@@ -385,6 +388,7 @@ class MeteoraDLMMProvider:
                     pool,
                     price_history=closes,
                     price_observations=observations,
+                    history_interval_seconds=history_interval_seconds,
                 )
             )
 

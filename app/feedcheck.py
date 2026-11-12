@@ -30,6 +30,27 @@ def run_check(provider: Any, rates: Any = None, out: Callable[[str], None] = pri
     for key in ("rows", "after_filter", "snapshots", "with_usd_prices", "with_price_history"):
         if key in report:
             out(f"  {key.replace('_', ' '):<22}{report[key]}")
+
+    current_prices = report.get("current_price", {})
+    if current_prices:
+        out("  current-price diagnostics:")
+        for key in (
+            "requested_coins",
+            "requests",
+            "failed_requests",
+            "returned_records",
+            "accepted_quotes",
+            "missing_records",
+            "rejected_quotes",
+            "unresolved_due_to_request_failure",
+        ):
+            out(f"    {key.replace('_', ' '):<36}{current_prices.get(key, 0)}")
+
+        reasons = current_prices.get("rejection_reasons", {})
+        if reasons:
+            out("    rejection reasons:")
+            for reason, count in sorted(reasons.items()):
+                out(f"      {reason:<32}{count}")
     if report.get("projects_on_chosen_chains"):
         out("  projects on the chosen chains: " + ", ".join(f"{k} ({v})" for k, v in report["projects_on_chosen_chains"].items()))
     selector = PoolSelector()

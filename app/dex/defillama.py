@@ -97,6 +97,7 @@ class DefiLlamaPoolProvider:
         self.universe, self._fetch, self._clock = universe or PoolUniverse(), fetch, clock
         self.last_report: dict[str, Any] = {}
         self._chart_report: dict[str, Any] = {}
+        self._current_price_report: dict[str, Any] = {}
 
     # ---- universe filter -------------------------------------------------------
     def _eligible_rows(self, rows: Iterable[Any]) -> list[dict[str, Any]]:
@@ -135,21 +136,107 @@ class DefiLlamaPoolProvider:
         """Build small, deterministic batches for the historical chart API."""
         unique = sorted({normalize_coin_id(coin) for coin in ids})
         return [
-            ",".join(quote(coin, safe=":,") for coin in unique[k:k + CHART_BATCH])
+            ",".join(
+                quote(coin, safe=":,")
+                for coin in unique[k:k + CHART_BATCH]
+            )
             for k in range(0, len(unique), CHART_BATCH)
         ]
 
-    def _current_prices(self, ids: list[str]) -> dict[str, float]:
-        prices: dict[str, float] = {}
-        for batch in self._batches(ids):
+    def _current_prices(self, ids: list[str]) -> dict[str, tuple[float, float]]:
+        """Return fresh, confident USD quotes and record why others were rejected."""
+        prices: dict[str, tuple[float, float]] = {}
+        requested = sorted({normalize_coin_id(coin) for coin in ids})
+        now = self._clock()
+        max_age_seconds = 15 * 60
+
+        report: dict[str, Any] = {
+            "requested_coins": len(requested),
+            "requests": 0,
+            "failed_requests": 0,
+            "returned_records": 0,
+            "accepted_quotes": 0,
+            "missing_records": 0,
+            "rejected_quotes": 0,
+            "unresolved_due_to_request_failure": 0,
+            "rejection_reasons": {},
+            "request_failures": [],
+            "max_quote_age_seconds": max_age_seconds,
+            "minimum_confidence": MIN_PRICE_CONFIDENCE,
+        }
+        rejection_reasons: dict[str, int] = {}
+
+        for batch in self._batches(requested):
+            batch_ids = batch.split(",")
+            report["requests"] += 1
+
             try:
-                coins = self._fetch(CURRENT_URL.format(coins=batch)).get("coins", {})
-            except (ProviderError, AttributeError):
-                continue                          # missing prices exclude pools later; never guessed
-            for coin, record in coins.items():
-                if isinstance(record, dict) and _finite(record.get("price")) and record["price"] > 0 \
-                        and _finite(record.get("confidence", 1.0)) and record.get("confidence", 1.0) >= MIN_PRICE_CONFIDENCE:
-                    prices[normalize_coin_id(coin)] = float(record["price"])
+                payload = self._fetch(CURRENT_URL.format(coins=batch))
+            except (ProviderError, AttributeError) as error:
+                report["failed_requests"] += 1
+                report["unresolved_due_to_request_failure"] += len(batch_ids)
+                report["request_failures"].append({
+                    "batch_size": len(batch_ids),
+                    "error": str(error),
+                })
+                continue
+
+            coins = payload.get("coins") if isinstance(payload, dict) else None
+            if not isinstance(coins, dict):
+                report["failed_requests"] += 1
+                report["unresolved_due_to_request_failure"] += len(batch_ids)
+                report["request_failures"].append({
+                    "batch_size": len(batch_ids),
+                    "error": "response did not contain a valid coins dictionary",
+                })
+                continue
+
+            report["returned_records"] += len(coins)
+            normalized_records = {
+                normalize_coin_id(coin): record
+                for coin, record in coins.items()
+            }
+
+            for coin in batch_ids:
+                if coin not in normalized_records:
+                    report["missing_records"] += 1
+                    continue
+
+                record = normalized_records[coin]
+                reason = None
+
+                if not isinstance(record, dict):
+                    reason = "invalid_record"
+                else:
+                    price = record.get("price")
+                    timestamp = record.get("timestamp")
+                    confidence = record.get("confidence", 1.0)
+
+                    if not _finite(price) or price <= 0:
+                        reason = "invalid_price"
+                    elif not _finite(timestamp) or timestamp < 0:
+                        reason = "invalid_timestamp"
+                    elif not _finite(confidence):
+                        reason = "invalid_confidence"
+                    elif confidence < MIN_PRICE_CONFIDENCE:
+                        reason = "low_confidence"
+                    else:
+                        age_seconds = now - float(timestamp)
+                        if age_seconds < 0:
+                            reason = "future_timestamp"
+                        elif age_seconds > max_age_seconds:
+                            reason = "stale_quote"
+
+                if reason is not None:
+                    report["rejected_quotes"] += 1
+                    rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+                    continue
+
+                prices[coin] = (float(price), float(timestamp))
+                report["accepted_quotes"] += 1
+
+        report["rejection_reasons"] = dict(sorted(rejection_reasons.items()))
+        self._current_price_report = report
         return prices
 
     def _charts(self, ids: list[str]) -> dict[str, list[tuple[float, float]]]:
@@ -418,10 +505,16 @@ class DefiLlamaPoolProvider:
             raise ProviderError("no pool passed the universe filter; check the chain, project and token settings")
         ids = [i for s in snapshots if (pair := self._coin_ids(s)) for i in pair]
         prices, charts = self._current_prices(ids), self._charts(ids)
+        expected_interval_seconds = (
+            3600.0 if self.universe.history_period == "1h" else 86400.0
+        )
         out, priced, with_history = [], 0, 0
         for snapshot in snapshots:
             pair = self._coin_ids(snapshot)
-            p0, p1 = (prices.get(pair[0]), prices.get(pair[1])) if pair else (None, None)
+            quote0 = prices.get(pair[0]) if pair else None
+            quote1 = prices.get(pair[1]) if pair else None
+            p0, t0 = quote0 if quote0 is not None else (None, None)
+            p1, t1 = quote1 if quote1 is not None else (None, None)
             observations: list[tuple[float, float]] = []
             if pair and pair[0] in charts and pair[1] in charts:
                 observations = self._ratio_observations(
@@ -432,9 +525,17 @@ class DefiLlamaPoolProvider:
             history = tuple(price for _, price in observations)
             priced += bool(p0 and p1)
             with_history += len(history) >= 14
-            out.append(replace(snapshot, price0_usd=p0, price1_usd=p1, price_history=history,
-                               price_observations=tuple(observations),
-                               source="defillama (yields.llama.fi, coins.llama.fi)"))
+            out.append(replace(
+                snapshot,
+                price0_usd=p0,
+                price1_usd=p1,
+                price0_as_of=t0,
+                price1_as_of=t1,
+                history_interval_seconds=expected_interval_seconds,
+                price_history=history,
+                price_observations=tuple(observations),
+                source="defillama (yields.llama.fi, coins.llama.fi)",
+            ))
         seen = Counter(r.get("project") for r in rows if isinstance(r, dict) and str(r.get("chain", "")).lower() in self.universe.chains)
         history_counts = [len(pool.price_observations) for pool in out if pool.price_observations]
         history_coverage_hours = [
@@ -464,6 +565,7 @@ class DefiLlamaPoolProvider:
             "snapshots": len(out),
             "with_usd_prices": priced,
             "with_price_history": with_history,
+            "current_price": dict(self._current_price_report),
             "history_period": self.universe.history_period,
             "history_span": self.universe.effective_history_span,
             "history_alignment_tolerance_seconds": self.universe.effective_alignment_tolerance_seconds,

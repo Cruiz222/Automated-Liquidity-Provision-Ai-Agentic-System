@@ -61,6 +61,8 @@ class SelectorConfig:
     min_history_points: int = 14
     min_history_days: float = 14.0
     max_history_gap_hours: float = 48.0
+    max_current_price_age_seconds: float = 900.0
+    max_history_tail_intervals: float = 2.0
     assumed_stable_vol: float = 0.02
     reserve_fraction: float = 0.10
     max_pool_weight: float = 0.40
@@ -92,6 +94,19 @@ class SelectorConfig:
             or self.max_history_gap_hours <= 0
         ):
             raise ValueError("max_history_gap_hours must be positive and finite")
+        for name in (
+            "max_current_price_age_seconds",
+            "max_history_tail_intervals",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be positive and finite")
+
         if not 0 <= self.reserve_fraction < 1:
             raise ValueError("reserve_fraction must be in [0, 1)")
         if not 0 < self.max_pool_weight <= 1 or not 0 < self.max_pool_tvl_share <= 1:
@@ -186,27 +201,125 @@ class PoolSelector:
             return tuple(price for _, price in pool.price_observations)
         return pool.price_history
 
-    def _volatility(self, pool: PoolSnapshot, category: PoolCategory, reasons: list[str],
-                    warnings: list[str]) -> float | None:
+    def _fresh_usd_price(
+        self,
+        pool: PoolSnapshot,
+        price_field: str,
+        timestamp_field: str,
+        label: str,
+        now: float,
+        warnings: list[str],
+    ) -> float | None:
+        """Return a USD quote only when its source timestamp proves freshness."""
+        price = getattr(pool, price_field)
+        timestamp = getattr(pool, timestamp_field)
+
+        if price is None:
+            warnings.append(f"{label} USD price unavailable")
+            return None
+
+        if (
+            isinstance(price, bool)
+            or not isinstance(price, (int, float))
+            or not math.isfinite(price)
+            or price <= 0
+        ):
+            warnings.append(f"{label} USD price invalid; withholding it")
+            return None
+
+        if (
+            timestamp is None
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+        ):
+            warnings.append(f"{label} USD price has no valid source timestamp")
+            return None
+
+        age_seconds = now - timestamp
+        if age_seconds < 0:
+            warnings.append(f"{label} USD price source timestamp is in the future")
+            return None
+
+        if age_seconds > self.config.max_current_price_age_seconds:
+            warnings.append(
+                f"stale {label} USD price ({age_seconds:.0f}s old; "
+                f"limit {self.config.max_current_price_age_seconds:.0f}s)"
+            )
+            return None
+
+        return float(price)
+
+    def _volatility(
+        self,
+        pool: PoolSnapshot,
+        category: PoolCategory,
+        reasons: list[str],
+        warnings: list[str],
+        now: float,
+    ) -> float | None:
         cfg = self.config
 
         if pool.price_observations:
             observations = pool.price_observations
-            coverage_days = (
-                observations[-1][0] - observations[0][0]
-            ) / 86400.0 if len(observations) >= 2 else 0.0
+            history_error = None
 
             if len(observations) < 3:
                 history_error = (
                     f"insufficient timestamped price history "
                     f"({len(observations)} < 3 observations)"
                 )
-            elif coverage_days < cfg.min_history_days:
+
+            latest_timestamp = observations[-1][0]
+            age_seconds = now - latest_timestamp
+
+            if age_seconds < 0:
+                history_error = "latest historical price observation is in the future"
+
+            interval = pool.history_interval_seconds
+
+            # Older snapshots may not contain interval metadata.
+            # Infer it from median observation spacing instead of assuming
+            # that every historical dataset is hourly or daily.
+            if interval is None and len(observations) >= 2:
+                gaps = sorted(
+                    observations[index][0] - observations[index - 1][0]
+                    for index in range(1, len(observations))
+                )
+                middle = len(gaps) // 2
+                if len(gaps) % 2:
+                    interval = gaps[middle]
+                else:
+                    interval = (gaps[middle - 1] + gaps[middle]) / 2.0
+
+                if interval > 0:
+                    warnings.append(
+                        "history interval missing; inferred from median observation spacing"
+                    )
+
+            if history_error is None and interval is None:
+                history_error = "cannot verify historical price freshness: interval unknown"
+
+            if history_error is None and age_seconds > (
+                interval * cfg.max_history_tail_intervals
+            ):
+                history_error = (
+                    f"stale historical price tail ({age_seconds:.0f}s old; "
+                    f"limit {interval * cfg.max_history_tail_intervals:.0f}s)"
+                )
+
+            coverage_days = (
+                observations[-1][0] - observations[0][0]
+            ) / 86400.0 if len(observations) >= 2 else 0.0
+
+            if history_error is None and coverage_days < cfg.min_history_days:
                 history_error = (
                     f"insufficient price-history coverage "
                     f"({coverage_days:.2f} < {cfg.min_history_days:.2f} days)"
                 )
-            else:
+
+            if history_error is None:
                 try:
                     measured = annualized_volatility_from_observations(
                         observations,
@@ -220,20 +333,34 @@ class PoolSelector:
                         if category == PoolCategory.STABLECOIN_STABLECOIN
                         else measured
                     )
+
         elif len(pool.price_history) >= cfg.min_history_points:
             # Backward compatibility for old snapshots and fixtures whose
             # histories have no timestamps and are documented as daily closes.
             measured = annualized_volatility(pool.price_history)
-            warnings.append("volatility uses legacy un-timestamped daily price history")
-            return max(measured, cfg.assumed_stable_vol) if category == PoolCategory.STABLECOIN_STABLECOIN else measured
+            warnings.append(
+                "volatility uses legacy un-timestamped daily price history"
+            )
+            return (
+                max(measured, cfg.assumed_stable_vol)
+                if category == PoolCategory.STABLECOIN_STABLECOIN
+                else measured
+            )
+
         else:
             history_error = (
                 f"insufficient price history "
                 f"({len(pool.price_history)} < {cfg.min_history_points} daily points)"
             )
 
-        if category == PoolCategory.STABLECOIN_STABLECOIN and not pool.price_observations and not pool.price_history:
-            warnings.append(f"no price history; assuming {cfg.assumed_stable_vol:.0%} annual volatility")
+        if (
+            category == PoolCategory.STABLECOIN_STABLECOIN
+            and not pool.price_observations
+            and not pool.price_history
+        ):
+            warnings.append(
+                f"no price history; assuming {cfg.assumed_stable_vol:.0%} annual volatility"
+            )
             return cfg.assumed_stable_vol
 
         reasons.append(history_error)
@@ -246,9 +373,23 @@ class PoolSelector:
         limits = cfg.category_limits[category]
         reasons: list[str] = []
         warnings: list[str] = []
-        evaluation = PoolEvaluation(pool_id=pool.pool_id, category=category, eligible=False, chain=pool.chain,
-                                    tokens=(pool.token0, pool.token1), tvl_usd=pool.tvl_usd,
-                                    latest_price=pool.latest_price, price0_usd=pool.price0_usd, price1_usd=pool.price1_usd)
+        price0_usd = self._fresh_usd_price(
+            pool, "price0_usd", "price0_as_of", "token0", now, warnings
+        )
+        price1_usd = self._fresh_usd_price(
+            pool, "price1_usd", "price1_as_of", "token1", now, warnings
+        )
+        evaluation = PoolEvaluation(
+            pool_id=pool.pool_id,
+            category=category,
+            eligible=False,
+            chain=pool.chain,
+            tokens=(pool.token0, pool.token1),
+            tvl_usd=pool.tvl_usd,
+            latest_price=None,
+            price0_usd=price0_usd,
+            price1_usd=price1_usd,
+        )
 
         age_hours = (now - pool.as_of) / 3600.0
         if age_hours > cfg.max_snapshot_age_hours:
@@ -283,14 +424,35 @@ class PoolSelector:
             fee_apr *= cfg.concentrated_fee_haircut
             warnings.append(f"concentrated-liquidity pool: fee APR cut by {1 - cfg.concentrated_fee_haircut:.0%} for a full-range position")
 
-        vol = self._volatility(pool, category, reasons, warnings)
+        vol = self._volatility(pool, category, reasons, warnings, now)
         evaluation.volatility = vol
+
+        # Relative pool prices are valuation inputs when timestamped
+        # observations or validated legacy history passed freshness checks.
+        if vol is not None and (pool.price_observations or pool.price_history):
+            relative_price = pool.latest_price
+            if (
+                relative_price is not None
+                and not isinstance(relative_price, bool)
+                and isinstance(relative_price, (int, float))
+                and math.isfinite(relative_price)
+                and relative_price > 0
+            ):
+                evaluation.latest_price = float(relative_price)
+            elif relative_price is not None:
+                warnings.append("relative pool price is invalid; withholding it")
+        elif pool.latest_price is not None:
+            warnings.append(
+                "relative pool price withheld because fresh timestamped history "
+                "could not be verified"
+            )
+
         il_apr = 0.0
         if vol is not None:
             il_apr = expected_v2_il(vol, cfg.horizon_days) * 365.0 / cfg.horizon_days
 
         depeg_component = 0.0
-        history_prices = self._history_prices(pool)
+        history_prices = self._history_prices(pool) if vol is not None else ()
         if category == PoolCategory.STABLECOIN_STABLECOIN and history_prices:
             depeg_component = min(1.0, max(abs(p - 1.0) for p in history_prices) / 0.03)
             if depeg_component >= 0.5:

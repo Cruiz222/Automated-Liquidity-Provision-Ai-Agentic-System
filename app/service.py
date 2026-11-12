@@ -761,9 +761,9 @@ class PlatformService:
         snapshot = by_id.get(pool_id) if isinstance(pool_id, str) else None
         if snapshot is None:
             raise NotFound("pool not found")
+        evaluation = selector.evaluate(snapshot, self.clock())
         existing = self._operation_exists(key)
         if not existing:
-            evaluation = selector.evaluate(snapshot, self.clock())
             if not evaluation.eligible:
                 raise InvalidOperation("pool is not eligible: " + "; ".join(evaluation.reasons))
             if amount < int(self.selector_config.min_position_usd * MICRO):
@@ -774,10 +774,17 @@ class PlatformService:
             if self.positions.count_open(user_id) >= self.settings.max_open_positions:
                 raise LimitExceeded(f"at most {self.settings.max_open_positions} open positions")
             self._pool_capacity(snapshot, amount)
-        result = self.positions.open_position(user_id, snapshot.pool_id, snapshot.token0, snapshot.token1, amount, key,
-                                              entry_price=snapshot.latest_price,
-                                              entry_prices=(snapshot.price0_usd, snapshot.price1_usd),
-                                              pool_capacity_minor=self._pool_cap(snapshot))
+        result = self.positions.open_position(
+            user_id,
+            snapshot.pool_id,
+            snapshot.token0,
+            snapshot.token1,
+            amount,
+            key,
+            entry_price=evaluation.latest_price,
+            entry_prices=(evaluation.price0_usd, evaluation.price1_usd),
+            pool_capacity_minor=self._pool_cap(snapshot),
+        )
         if not existing and self._mode.get() == "live":
             try:
                 if self.chain is None:
@@ -832,18 +839,33 @@ class PlatformService:
         if not force and last is not None and now - last < self.settings.min_mark_interval_seconds:
             return
         principal = position["principal_minor"]
-        p0, p1 = snapshot.price0_usd, snapshot.price1_usd
+        evaluation = selector.evaluate(snapshot, now)
+        p0, p1 = evaluation.price0_usd, evaluation.price1_usd
         e0, e1 = position.get("entry_price0_usd"), position.get("entry_price1_usd")
-        entry, price = position.get("entry_price"), snapshot.latest_price
-        if p0 and p1 and e0 and e1:
+        entry, price = position.get("entry_price"), evaluation.latest_price
+
+        if (
+            p0 is not None and p1 is not None
+            and e0 is not None and e1 is not None
+            and e0 > 0 and e1 > 0
+        ):
             value = principal * math.sqrt((p0 / e0) * (p1 / e1))
-        elif entry and price:
+        elif (
+            entry is not None and price is not None
+            and entry > 0 and price > 0
+        ):
             value = principal * math.sqrt(price / entry)
         else:
-            value = float(principal)
+            # Keep the last defensible market value when fresh prices are
+            # unavailable. Fee accrual is independent of market valuation.
+            value = float(position["current_value_minor"])
+
         since = last if last is not None else (position.get("opened_ts") or now)
         elapsed = max(0.0, now - since) * self.settings.time_scale
-        accrued = position["accrued_fees_minor"] + principal * selector.evaluate(snapshot, now).fee_apr * elapsed / (365.0 * 86_400)
+        accrued = (
+            position["accrued_fees_minor"]
+            + principal * evaluation.fee_apr * elapsed / (365.0 * 86_400)
+        )
         ceiling = principal * self.positions.max_mark_multiple
         fees = max(int(min(accrued, max(ceiling - value, 0.0))), position["accrued_fees_minor"])
         value = int(min(value, ceiling - fees))

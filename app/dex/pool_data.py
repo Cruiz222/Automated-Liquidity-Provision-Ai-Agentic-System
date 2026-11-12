@@ -76,6 +76,9 @@ class PoolSnapshot:
     token_addresses: tuple[str, ...] = ()   # contract addresses of the two tokens, when the source gives them
     as_of: float = 0.0                      # unix seconds
     source: str = "unknown"
+    price0_as_of: float | None = None
+    price1_as_of: float | None = None
+    history_interval_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.pool_id or not isinstance(self.pool_id, str):
@@ -107,6 +110,17 @@ class PoolSnapshot:
             value = getattr(self, name)
             if value is not None and (not _finite(value) or value <= 0):
                 raise ValueError(f"{name} must be a positive number")
+
+        for name in ("price0_as_of", "price1_as_of"):
+            value = getattr(self, name)
+            if value is not None and (not _finite(value) or value < 0):
+                raise ValueError(f"{name} must be a non-negative finite number")
+
+        if self.history_interval_seconds is not None and (
+            not _finite(self.history_interval_seconds)
+            or self.history_interval_seconds <= 0
+        ):
+            raise ValueError("history_interval_seconds must be a positive finite number")
         if any(not _finite(p) or p <= 0 for p in self.price_history):
             raise ValueError("price_history must contain positive numbers")
 
@@ -177,7 +191,8 @@ def with_price_history(snapshot: PoolSnapshot, prices: Iterable[float]) -> PoolS
 
 _FIELDS = ("pool_id", "chain", "dex", "token0", "token1", "tvl_usd", "fee_tier_bps", "volume_usd_1d",
            "volume_usd_7d", "price_history", "price_observations", "reported_fee_apr", "correlation", "audited", "age_days",
-           "price0_usd", "price1_usd", "token_addresses", "as_of", "source")
+           "price0_usd", "price1_usd", "token_addresses", "as_of", "source",
+           "price0_as_of", "price1_as_of", "history_interval_seconds")
 
 
 def load_snapshots(path: str | Path) -> tuple[list[PoolSnapshot], dict[str, Any]]:
