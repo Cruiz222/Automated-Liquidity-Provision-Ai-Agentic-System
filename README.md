@@ -184,3 +184,29 @@ Protocol integrations should be developed incrementally:
 - Expand to automated capital movement only after the individual integrations have passed their security and operational tests.
 
 All protocol interactions must be independently testable and isolated behind application-level interfaces.
+
+
+Yes—programming your AI with balance-aware "capital tiers" is the exact right architecture. Instead of forcing a single strategy across every portfolio size, your agent can dynamically adjust its pool selection, price-range width, and rebalancing thresholds based on your current wallet balance.
+
+Capital-Tiered AI Strategy Framework
+
+
+Capital Tier	Target Pool Type	Price Range Strategy	Rebalance Trigger Rule
+Micro Tier ($50 – $250)	High-fee trending meme pairs (1% – 5% fee tiers) or high-volume SOL pairs.	Wide ranges (±15% to ±30%) so the position earns fees for days without needing costly rebalances.	Only rebalance if unclaimed fees are at least 3x to 5x the total gas + slippage cost, or if price breaks out for >4 hours.
+Growth Tier ($250 – $2,000)	Established mid-cap volatile pairs (e.g., JUP/SOL, WIF/SOL, BONK/SOL at 0.25% – 1% fee tiers).	Moderate ranges (±5% to ±15%) adjusted dynamically using 24-hour volatility (ATR).	Rebalance when unclaimed fees exceed 2x the rebalance cost, allowing 1–2 adjustments per day.
+Scale Tier ($2,000+)	Deep-liquidity blue-chip pairs (SOL/USDC, SOL/USDT) alongside high-volume meme pools.	Tight, high-efficiency ranges (±1% to ±5%) to capture maximum fee share during sideways chop.	Frequent dynamic rebalancing (every 15–60 minutes during active volume) + optional delta-hedging on perps.
+
+
+Key Rules to Code Into Your Balance-Aware Agent
+
+• Dynamic Fee-to-Cost Gatekeeper. Before your AI executes any rebalance or pool switch, have it run a simple math check: Net_Profit = Unclaimed_Fees - (Estimated_Gas + Priority_Fee + Swap_Slippage). If Net_Profit is negative or below your tier's threshold, the AI must hold or simply widen its patience window.
+• Single-Position Concentration at Low Balances. When your balance is under $500, force the AI to deploy 100% of active LP capital into one single pool. Splitting $50 across two or three pools doubles or triples your Solana account rent deposits (~0.05 SOL per position) and fragments your fee yield.
+• Auto-Compound vs. Profit Skimming. Program the AI to auto-compound earned fees back into the LP position while in the Micro and Growth tiers to accelerate balance scaling. Once it crosses into the Scale tier, have it skim 20% to 50% of harvested fees into safe USDC or SOL reserves.
+• Volatility-Adjusted Range Sizing. Feed your AI a simple volatility metric (such as Average True Range or standard deviation of hourly returns). When volatility spikes, the AI automatically widens the bin range to avoid getting immediately pushed out of range and incurring impermanent loss.
+
+Recommended Architecture Flow
+
+1. Balance Check Module. Reads current wallet SOL + USDC + active LP value.
+2. Tier Selector. Loads the matching configuration rules (Micro, Growth, or Scale).
+3. Pool Scanner. Queries Meteora DLMM or Orca APIs for pools matching the tier's minimum liquidity, volume-to-TVL ratio, and fee tier.
+4. Execution & Profit Guard. Opens the position, monitors price boundaries, and blocks any rebalance that fails the Net_Profit check.

@@ -20,8 +20,9 @@ integration; they are not a substitute for a security review.
 
 * **Passwords**: PBKDF2-HMAC-SHA256 (600,000 iterations by default, parameters stored per hash and upgraded on login),
   12 to 128 characters, common/repetitive/username-containing passwords rejected.
-* **Login**: failures limited per username and per address (5 and 30 per 15 minutes); unknown and known users take the
-  same path and return the same error, so lockout does not reveal which usernames exist.
+* **Login**: attempts are atomically reserved against per-username and per-address limits (5 and 30 per 15 minutes);
+  unknown and known users take the same password-check path and return the same error, so lockout does not reveal which
+  usernames exist. The limiter is thread-safe within one process.
 * **Sessions**: 256-bit random tokens, only the SHA-256 is stored; HttpOnly, SameSite=Strict cookie (Secure when
   configured); 8-hour absolute and 1-hour idle expiry; at most 5 per user; revoked on logout and on password change.
 * **CSRF and cross-site**: per-session CSRF token required on every authenticated write; `Origin` and `Sec-Fetch-Site`
@@ -37,12 +38,13 @@ integration; they are not a substitute for a security review.
 
 ## Added in milestone 5
 
-* **Two-factor authentication**: RFC 6238 TOTP (checked against the RFC's test vectors), each code usable once, eight
-  one-time recovery codes stored only as hashes, required at login and for withdrawals, with failures counted toward
-  lockout. Disabling needs the password and a code.
-* **Email verification and password reset**: 8-digit codes valid 15 minutes, five guesses, hashed at rest, issuance rate
-  limited; reset codes go only to verified addresses, the request response never reveals whether an account exists, and a
-  reset signs out every session (2FA stays on). An unverified address cannot block someone else from verifying it.
+* **Two-factor authentication**: RFC 6238 TOTP (checked against the RFC's test vectors), each code usable once and
+  failures counted toward lockout. Disabling needs the password and a current code. Starting enrollment requires fresh
+  password authentication.
+* **Email verification and password reset**: 8-digit codes valid 15 minutes, five guesses, keyed HMAC digests at rest,
+  issuance rate limited; reset codes go only to verified addresses, the request response never reveals whether an account
+  exists, and a reset signs out every session and disables TOTP for lost-device recovery. Changing an email requires the
+  current password and, when enabled, a fresh TOTP code. An unverified address cannot block someone else from verifying it.
 * **KYC tiers** drive withdrawal limits. The BVN is never stored (last four digits plus a keyed hash to stop reuse).
   Outside simulation nothing is auto-approved.
 * **Payout destinations**: bank codes are checked against the account number (NUBAN), saved payout accounts are private
@@ -58,8 +60,10 @@ integration; they are not a substitute for a security review.
   five wrong PINs lock PIN use for 15 minutes. Setting the first PIN needs the account password; changing it needs the old
   PIN; a forgotten PIN is reset with an emailed code plus the password.
 * The PIN is hashed with PBKDF2 and a **server-side secret kept in a separate owner-only file** (`secret.key`), because
-  a 6-digit PIN can be brute-forced offline from a leaked database alone. Back that file up separately; if it is lost,
-  customers reset their PINs by email. A replay of an already-recorded operation needs no new PIN (it changes nothing).
+  a 6-digit PIN can be brute-forced offline from a leaked database alone. Email-code HMAC keys are derived from that
+  secret with domain separation. Existing secret files must be regular files owned by the app user with mode 0600;
+  insecure, symbolic-link, or truncated files are rejected. Back the file up separately; if it is lost, customers reset
+  their PINs by email. A replay of an already-recorded operation needs no new PIN (it changes nothing).
 * **Recovery codes are gone.** Account recovery is the email password reset, which also turns off the optional
   authenticator app (a lost phone cannot lock anyone out). The authenticator remains only as an optional login factor.
 * **Outbound data fetches** are limited to an allowlist of public data hosts over HTTPS, refuse redirects, cap the response
@@ -70,8 +74,9 @@ integration; they are not a substitute for a security review.
 ## Residual risks and things not built
 
 * **TLS is the proxy's job.** The server speaks HTTP on loopback only; see `docs/DEPLOYMENT.md` for a TLS proxy setup.
-* Rate-limit counters live in memory and reset on restart. Per-username lockout lets an attacker lock a known
-  account out for 15 minutes (a deliberate trade-off against password guessing).
+* Rate-limit counters live in memory and reset on restart; the atomic limiter only coordinates threads in one process.
+  Production multi-process or multi-instance deployment needs a shared persistent limiter (for example Redis). Per-username
+  lockout lets an attacker lock a known account out for 15 minutes (a deliberate trade-off against password guessing).
 * 2FA secrets and email addresses sit unencrypted in the database file (owner-only permissions); production needs
   encryption at rest with managed keys. No SMS or hardware-key 2FA, no admin or support tooling, no account recovery for
   a user who loses both their device and recovery codes.
