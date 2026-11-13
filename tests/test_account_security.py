@@ -11,6 +11,7 @@ from app.accounts import (
     OtpRequired, PinNotSet, PinRequired, RateLimited, SmtpMailer, ValidationError, totp, validate_pin,
 )
 from app.ledger import WalletLedger
+from app.service import load_secret
 
 PW = "correct-horse-battery"
 NEW_PW = "a-completely-new-password"
@@ -38,7 +39,7 @@ class Case(unittest.TestCase):
         return totp.code_at(secret, totp.current_step(self.clock.now))
 
     def enable_2fa(self, user_id):
-        secret = self.accounts.totp_begin(user_id)["secret"]
+        secret = self.accounts.totp_begin(user_id, PW)["secret"]
         self.accounts.totp_confirm(user_id, self.code_now(secret))
         return secret, None
 
@@ -100,13 +101,13 @@ class TestTwoFactor(Case):
         self.assertTrue(self.accounts.login("alice", PW, otp=self.code_now(secret)))
 
     def test_enrolment_needs_a_valid_code_and_cannot_be_repeated(self):
-        secret = self.accounts.totp_begin(self.user)["secret"]
+        secret = self.accounts.totp_begin(self.user, PW)["secret"]
         with self.assertRaises(AuthError):
             self.accounts.totp_confirm(self.user, "000000")
         self.assertFalse(self.accounts.totp_status(self.user)["enabled"])
         self.accounts.totp_confirm(self.user, self.code_now(secret))
         with self.assertRaises(ConflictError):
-            self.accounts.totp_begin(self.user)
+            self.accounts.totp_begin(self.user, PW)
         with self.assertRaises(ConflictError):
             self.accounts.totp_confirm(self.user, self.code_now(secret))
 
@@ -213,6 +214,13 @@ class TestTransactionPin(Case):
 
 
 class TestEmail(Case):
+    def test_email_code_digest_is_keyed_and_not_reusable_with_another_server_secret(self):
+        digest = self.accounts._hash_code("01234567", "u_test", "verify")
+        other = AccountStore(self.ledger, password_iterations=1000, clock=self.clock, limiter_clock=self.clock,
+                             mailer=self.mailer, pin_pepper=b"r" * 32)
+        self.assertNotEqual(digest, other._hash_code("01234567", "u_test", "verify"))
+        self.assertEqual(len(digest), 64)
+
     def test_registration_with_email_sends_a_code_and_verifies(self):
         user = self.accounts.register("alice", PW, email="Alice@Example.com")["user_id"]
         self.assertEqual(self.mailer.sent[-1][0], "Alice@Example.com")
@@ -245,6 +253,89 @@ class TestEmail(Case):
         with self.assertRaises(AuthError):
             self.accounts.verify_email(user, first)
         self.accounts.verify_email(user, self.last_code())
+
+    def test_verification_code_cannot_be_used_for_a_different_pending_address(self):
+        user = self.accounts.register("alice", PW, email="original@example.com")["user_id"]
+        self.accounts.verify_email(user, self.last_code())
+
+        self.accounts.set_email(user, "first-pending@example.com", PW)
+        stale_code = self.last_code()
+
+        # Simulate a concurrent email-change request changing the pending target
+        # after the code was created but before that code is submitted.
+        with self.ledger.transaction():
+            self.ledger.db.execute(
+                "UPDATE users SET pending_email = ?, pending_email_key = ? WHERE user_id = ?",
+                ("second-pending@example.com", "second-pending@example.com", user),
+            )
+
+        with self.assertRaises(AuthError):
+            self.accounts.verify_email(user, stale_code)
+        status = self.accounts.security_status(user)
+        self.assertEqual(status["email"], "original@example.com")
+        self.assertTrue(status["email_verified"])
+        self.assertEqual(status["pending_email"], "second-pending@example.com")
+
+        self.accounts.send_email_code(user, "verify")
+        self.accounts.verify_email(user, self.last_code())
+        status = self.accounts.security_status(user)
+        self.assertEqual(status["email"], "second-pending@example.com")
+        self.assertTrue(status["email_verified"])
+        self.assertIsNone(status["pending_email"])
+
+    def test_email_change_invalidates_recovery_codes_sent_to_old_address(self):
+        user = self.accounts.register(
+            "alice", PW, email="original@example.com"
+        )["user_id"]
+        self.accounts.verify_email(user, self.last_code())
+
+        self.accounts.send_email_code(user, "reset")
+        reset_code = self.last_code()
+        self.accounts.send_email_code(user, "pin")
+        pin_code = self.last_code()
+        recovery_rows = self.ledger.db.execute(
+            "SELECT purpose, used FROM email_codes "
+            "WHERE user_id = ? AND purpose IN ('reset', 'pin')",
+            (user,),
+        ).fetchall()
+        self.assertEqual({row["purpose"] for row in recovery_rows}, {"reset", "pin"})
+        self.assertTrue(all(row["used"] == 0 for row in recovery_rows))
+
+        self.accounts.set_email(user, "new@example.com", PW)
+        self.accounts.verify_email(user, self.last_code())
+
+        recovery_rows = self.ledger.db.execute(
+            "SELECT purpose, used FROM email_codes "
+            "WHERE user_id = ? AND purpose IN ('reset', 'pin')",
+            (user,),
+        ).fetchall()
+        self.assertTrue(recovery_rows)
+        self.assertTrue(all(row["used"] == 1 for row in recovery_rows))
+        self.assertFalse(self.accounts._check_code(user, "reset", reset_code))
+        self.assertFalse(self.accounts._check_code(user, "pin", pin_code))
+
+    def test_recovery_code_for_noncurrent_email_is_rejected(self):
+        user = self.accounts.register(
+            "alice", PW, email="original@example.com"
+        )["user_id"]
+        self.accounts.verify_email(user, self.last_code())
+        self.accounts.send_email_code(user, "reset")
+        old_reset_code = self.last_code()
+        old_code_row = self.ledger.db.execute(
+            "SELECT code_hash, email_key FROM email_codes "
+            "WHERE user_id = ? AND purpose = 'reset' AND used = 0",
+            (user,),
+        ).fetchone()
+
+        # Simulate a stale recovery record surviving a partial/legacy migration.
+        with self.ledger.transaction():
+            self.ledger.db.execute(
+                "UPDATE users SET email = ?, email_key = ? WHERE user_id = ?",
+                ("new@example.com", "new@example.com", user),
+            )
+
+        self.assertNotEqual(old_code_row["email_key"], "new@example.com")
+        self.assertFalse(self.accounts._check_code(user, "reset", old_reset_code))
 
     def test_unverified_email_cannot_be_squatted_and_only_one_account_can_verify_it(self):
         a = self.accounts.register("alice", PW, ip="1", email="shared@example.com")["user_id"]
@@ -379,6 +470,111 @@ class TestMailersAndFiles(unittest.TestCase):
             ledger = WalletLedger(path)
             ledger.close()
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+
+
+class TestLoadSecret(unittest.TestCase):
+    def test_load_secret_creates_and_reuses_owner_only_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.key"
+            first = load_secret(path)
+            self.assertEqual(len(first), 32)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(load_secret(path), first)
+
+    def test_load_secret_rejects_permissive_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.key"
+            path.write_bytes(b"s" * 32)
+            path.chmod(0o644)
+            with self.assertRaises(PermissionError):
+                load_secret(path)
+
+    def test_load_secret_rejects_symbolic_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.key"
+            target.write_bytes(b"s" * 32)
+            target.chmod(0o600)
+            link = Path(tmp) / "secret.key"
+            link.symlink_to(target)
+            with self.assertRaises(PermissionError):
+                load_secret(link)
+
+    def test_load_secret_rejects_non_regular_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.key"
+            path.mkdir()
+            with self.assertRaises(PermissionError):
+                load_secret(path)
+
+    def test_load_secret_rejects_truncated_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.key"
+            path.write_bytes(b"short")
+            path.chmod(0o600)
+            with self.assertRaises(RuntimeError):
+                load_secret(path)
+
+
+
+class TestAccountStoreSecretValidation(unittest.TestCase):
+    def test_missing_secret_generates_a_32_byte_ephemeral_key(self):
+        ledger = WalletLedger()
+        try:
+            store = AccountStore(ledger, password_iterations=1000)
+            self.assertIsInstance(store.pin_pepper, bytes)
+            self.assertEqual(len(store.pin_pepper), 32)
+        finally:
+            ledger.close()
+
+    def test_explicit_invalid_secrets_are_rejected(self):
+        for invalid in (b"", b"short", b"x" * 31, b"x" * 33, "x" * 32, bytearray(b"x" * 32)):
+            ledger = WalletLedger()
+            try:
+                with self.subTest(secret_type=type(invalid).__name__, length=len(invalid)):
+                    with self.assertRaises(ValueError):
+                        AccountStore(
+                            ledger,
+                            password_iterations=1000,
+                            pin_pepper=invalid,
+                        )
+            finally:
+                ledger.close()
+
+
+class TestEmailChangeRace(Case):
+    def test_stale_email_change_request_cannot_create_or_send_code(self):
+        user = self.accounts.register(
+            "alice", PW, email="original@example.com"
+        )["user_id"]
+
+        with self.ledger.transaction():
+            self.ledger.db.execute(
+                "UPDATE users SET pending_email = ?, pending_email_key = ? WHERE user_id = ?",
+                ("second@example.com", "second@example.com", user),
+            )
+
+        sent_before = len(self.mailer.sent)
+        codes_before = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM email_codes WHERE user_id = ? AND purpose = 'verify'",
+            (user,),
+        ).fetchone()[0]
+
+        with self.assertRaises(ConflictError):
+            self.accounts.send_email_code(
+                user,
+                "verify",
+                expected_email_key="first@example.com",
+            )
+
+        sent_after = len(self.mailer.sent)
+        codes_after = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM email_codes WHERE user_id = ? AND purpose = 'verify'",
+            (user,),
+        ).fetchone()[0]
+
+        self.assertEqual(sent_after, sent_before)
+        self.assertEqual(codes_after, codes_before)
 
 
 if __name__ == "__main__":
