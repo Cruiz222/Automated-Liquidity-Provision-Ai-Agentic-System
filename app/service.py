@@ -4,13 +4,16 @@ talks to, so every business rule (limits, ownership, simulation gating) lives he
 from __future__ import annotations
 
 import contextvars
+import errno
 import hashlib
 import logging
 import math
 import os
 import re
 import secrets
+import stat
 import threading
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,18 +42,127 @@ CURRENCIES = ("NGN", "USDT")
 MAX_AMOUNT_MINOR = 10 ** 13
 
 
+def _validate_secret_directory(directory: Path) -> None:
+    """Require a real directory owned by this user and not writable by others."""
+    info = os.lstat(directory)
+
+    if not stat.S_ISDIR(info.st_mode):
+        raise PermissionError("secret key parent must be a real directory")
+
+    if info.st_uid != os.geteuid():
+        raise PermissionError(
+            "secret key directory must be owned by the application user"
+        )
+
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise PermissionError(
+            f"secret key directory is writable by group or others; "
+            f"run chmod go-w {directory}"
+        )
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist directory-entry changes after atomically creating the secret."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def load_secret(path: Path | None) -> bytes:
-    """A 32-byte server secret kept in an owner-only file, separate from the database, so a leaked database
-    alone cannot be used to brute-force 6-digit PINs. Lose the file and customers must reset their PINs by email."""
+    """Load a persistent owner-only server secret, creating it atomically."""
     if path is None:
         return secrets.token_bytes(32)
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size >= 32:
-        return path.read_bytes()[:32]
-    data = secrets.token_bytes(32)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(data)
+    _validate_secret_directory(path.parent)
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        data = secrets.token_bytes(32)
+
+        try:
+            os.fchmod(descriptor, 0o600)
+
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            try:
+                os.link(temporary_path, path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            else:
+                _fsync_directory(path.parent)
+                return data
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+        # Another process created the secret first.
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PermissionError(
+                    "secret key path must not be a symbolic link"
+                ) from exc
+            raise
+
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PermissionError(
+                "secret key path must not be a symbolic link"
+            ) from exc
+        raise
+
+    try:
+        info = os.fstat(descriptor)
+
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError("secret key must be a regular file")
+
+        if info.st_uid != os.geteuid():
+            raise PermissionError(
+                "secret key must be owned by the application user"
+            )
+
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise PermissionError(
+                f"secret key permissions are too broad; run chmod 600 {path}"
+            )
+
+        with os.fdopen(descriptor, "rb") as handle:
+            data = handle.read(33)
+
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+    if len(data) != 32:
+        raise RuntimeError(
+            "secret key file must contain exactly 32 bytes; "
+            "restore the original key or rotate affected credentials"
+        )
+
     return data
 
 

@@ -93,6 +93,7 @@ class Settings:
         return cls(
             host=env.get("DEX_HOST", defaults.host), port=int(env.get("DEX_PORT", defaults.port)),
             database=env.get("DEX_DB", defaults.database),
+            secret_key_path=env.get("DEX_SECRET_KEY_PATH", defaults.secret_key_path),
             pool_snapshot_path=env.get("DEX_POOLS", defaults.pool_snapshot_path),
             secure_cookies=env.get("DEX_SECURE_COOKIES", "") == "1",
             public_host=env.get("DEX_PUBLIC_HOST", ""), public_https=env.get("DEX_PUBLIC_HTTPS", "") == "1",
