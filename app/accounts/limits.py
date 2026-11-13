@@ -14,7 +14,11 @@ class RateLimited(Exception):
 
 
 class RateLimiter:
-    """Allow at most ``max_events`` per ``window_seconds`` for each key. Memory is bounded by ``max_keys``."""
+    """Apply sliding-window limits with bounded memory.
+
+    Expired keys are reclaimed; when all key slots are occupied by active keys,
+    new keys fail closed rather than evicting another key's security history.
+    """
 
     def __init__(self, max_events: int, window_seconds: float, clock: Callable[[], float] = time.monotonic,
                  max_keys: int = 10_000) -> None:
@@ -41,21 +45,36 @@ class RateLimiter:
             events = self._trim(key, now)
             return self.window - (now - events[0]) if len(events) >= self.max_events else 0.0
 
+    def _record_locked(self, key: str, now: float) -> None:
+        if key not in self._events:
+            # Iterate over a stable snapshot because _trim() removes expired keys.
+            for existing_key in tuple(self._events):
+                self._trim(existing_key, now)
+            if len(self._events) >= self.max_keys:
+                # Never evict an active key: flooding fresh keys must not bypass limits.
+                earliest_expiry = min(events[0] + self.window for events in self._events.values())
+                raise RateLimited(max(0.0, earliest_expiry - now))
+            self._events[key] = deque((now,))
+            return
+        self._events[key].append(now)
+
     def hit(self, key: str) -> None:
+        """Record an event without checking its per-key threshold.
+
+        Raises RateLimited if a new key cannot be admitted without evicting an
+        active key and weakening that key's protection.
+        """
         with self._lock:
-            now = self.clock()
-            if key not in self._events and len(self._events) >= self.max_keys:
-                for stale in [k for k in self._events if not self._trim(k, now)]:
-                    self._events.pop(stale, None)
-                if len(self._events) >= self.max_keys:     # still full: drop the oldest-active key
-                    self._events.pop(min(self._events, key=lambda k: self._events[k][-1]), None)
-            self._events.setdefault(key, deque()).append(now)
+            self._record_locked(key, self.clock())
 
     def check_and_hit(self, key: str) -> None:
-        retry = self.blocked_for(key)
-        if retry > 0:
-            raise RateLimited(retry)
-        self.hit(key)
+        """Atomically enforce the limit and reserve one attempt."""
+        with self._lock:
+            now = self.clock()
+            events = self._trim(key, now)
+            if len(events) >= self.max_events:
+                raise RateLimited(self.window - (now - events[0]))
+            self._record_locked(key, now)
 
     def reset(self, key: str) -> None:
         with self._lock:

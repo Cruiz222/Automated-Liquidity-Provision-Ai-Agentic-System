@@ -5,7 +5,7 @@ import base64
 import unittest
 
 from app.accounts import totp
-from app.accounts.auth import AccountStore, AuthError, ConflictError, OtpRequired
+from app.accounts.auth import AccountStore, AuthError, ConflictError, OtpRequired, RateLimited
 from app.ledger import WalletLedger
 
 
@@ -69,16 +69,24 @@ class AccountStoreTotpTests(unittest.TestCase):
         self.ledger = WalletLedger(":memory:")
         self.now = 1_700_000_000.0
         self.clock = lambda: self.now
-        self.store = AccountStore(self.ledger, clock=self.clock, password_iterations=1000,
-                                  pin_pepper=b"\x00" * 32)
+        self.store = AccountStore(
+            self.ledger,
+            clock=self.clock,
+            limiter_clock=self.clock,
+            password_iterations=1000,
+            pin_pepper=b"\x00" * 32,
+        )
         self.user = self.store.register("alice", "correct horse battery staple")["user_id"]
 
     def tearDown(self):
         self.ledger.close()
 
     def _enable(self) -> str:
-        secret = self.store.totp_begin(self.user)["secret"]
+        secret = self.store.totp_begin(self.user, "correct horse battery staple")["secret"]
         self.store.totp_confirm(self.user, _code(secret, totp.current_step(self.now)))
+        # Enrollment consumes its proof; move to the next time step for subsequent
+        # authentication in tests that exercise the enabled authenticator.
+        self.now += totp.STEP
         return secret
 
     def test_enable_disable_flow(self):
@@ -88,18 +96,83 @@ class AccountStoreTotpTests(unittest.TestCase):
                                 _code(secret, totp.current_step(self.now)))
         self.assertFalse(self.store.totp_status(self.user)["enabled"])
 
+    def test_enrollment_code_cannot_be_replayed_for_login(self):
+        secret = self.store.totp_begin(
+            self.user, "correct horse battery staple"
+        )["secret"]
+        step = totp.current_step(self.now)
+        enrollment_code = _code(secret, step)
+
+        self.store.totp_confirm(self.user, enrollment_code)
+
+        with self.assertRaises(AuthError):
+            self.store.login(
+                "alice",
+                "correct horse battery staple",
+                otp=enrollment_code,
+            )
+
+        with self.ledger.lock:
+            row = self.ledger.db.execute(
+                "SELECT totp_last_step FROM users WHERE user_id = ?",
+                (self.user,),
+            ).fetchone()
+        self.assertEqual(row["totp_last_step"], step)
+
     def test_login_requires_otp_and_consumes_step(self):
         secret = self._enable()
+
+        # Missing OTP is an incomplete MFA attempt, not a bad password.
         with self.assertRaises(OtpRequired):
             self.store.login("alice", "correct horse battery staple")
+
+        self.assertEqual(
+            self.store.user_limiter.blocked_for("u:alice"),
+            0.0,
+        )
+
         step = totp.current_step(self.now)
-        session = self.store.login("alice", "correct horse battery staple", otp=_code(secret, step))
+        session = self.store.login(
+            "alice",
+            "correct horse battery staple",
+            otp=_code(secret, step),
+        )
         self.assertIn("token", session)
+
         self.now += 1
-        with self.assertRaises(AuthError):
-            self.store.login("alice", "correct horse battery staple", otp=_code(secret, step))
-        self.now += totp.STEP
-        self.store.login("alice", "correct horse battery staple", otp=_code(secret, totp.current_step(self.now)))
+
+        # Replaying an already-consumed TOTP is a genuine failed
+        # authentication and must count toward the username lockout.
+        for _ in range(5):
+            with self.assertRaises(AuthError):
+                self.store.login(
+                    "alice",
+                    "correct horse battery staple",
+                    otp=_code(secret, step),
+                )
+
+        # The fifth failure reaches the configured lockout threshold.
+        self.assertGreater(
+            self.store.user_limiter.blocked_for("u:alice"),
+            0,
+        )
+
+        # A correct password and fresh OTP must still be rejected while locked.
+        with self.assertRaises(RateLimited):
+            self.store.login(
+                "alice",
+                "correct horse battery staple",
+                otp=_code(secret, totp.current_step(self.now)),
+            )
+
+        # Expire the 900-second username lockout and use a fresh TOTP step.
+        self.now += 901
+        session = self.store.login(
+            "alice",
+            "correct horse battery staple",
+            otp=_code(secret, totp.current_step(self.now)),
+        )
+        self.assertIn("token", session)
 
     def test_confirm_requires_pending_secret(self):
         with self.assertRaises(ConflictError):

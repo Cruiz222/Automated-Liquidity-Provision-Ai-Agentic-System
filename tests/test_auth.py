@@ -1,5 +1,7 @@
 import sqlite3
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from app.accounts import (
     AccountStore, AuthError, ConflictError, RateLimited, RateLimiter, ValidationError, hash_password, verify_password,
@@ -100,6 +102,65 @@ class TestLoginAndSessions(unittest.TestCase):
                 self.accounts.login(name, PW, f"ip-{name}-2")          # even the right password is refused
             self.assertGreater(ctx.exception.retry_after, 0)
 
+    def test_successful_logins_do_not_consume_ip_failure_allowance(self):
+        for _ in range(35):
+            self.accounts.login("alice", PW, "shared-ip")
+
+    def test_successful_login_does_not_clear_shared_ip_failures(self):
+        ip = "shared-ip"
+
+        for i in range(29):
+            with self.assertRaises(AuthError):
+                self.accounts.login(f"ghost{i}", "wrong-password-1", ip)
+
+        self.accounts.login("alice", PW, ip)
+
+        with self.assertRaises(AuthError):
+            self.accounts.login("another-ghost", "wrong-password-1", ip)
+
+        with self.assertRaises(RateLimited):
+            self.accounts.login("final-ghost", "wrong-password-1", ip)
+
+    def test_blocked_ip_does_not_consume_username_allowance(self):
+        ip = "blocked-shared-ip"
+        self.accounts.ip_limiter = RateLimiter(1, 60, self.clock)
+
+        with self.assertRaises(AuthError):
+            self.accounts.login("ghost", "wrong-password-1", ip)
+
+        with self.assertRaises(RateLimited):
+            self.accounts.login("alice", PW, ip)
+
+        self.assertEqual(
+            self.accounts.user_limiter.blocked_for("u:alice"),
+            0.0,
+        )
+
+    def test_concurrent_ip_failures_leave_ip_locked(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        ip = "concurrent-shared-ip"
+        self.accounts.ip_limiter = RateLimiter(5, 60, self.clock)
+
+        usernames = [f"unknown{i}" for i in range(12)]
+
+        def attempt(username):
+            try:
+                self.accounts.login(username, "wrong-password-1", ip)
+            except (AuthError, RateLimited):
+                return
+            self.fail("Invalid login unexpectedly succeeded")
+
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            list(executor.map(attempt, usernames))
+
+        self.assertGreater(
+            self.accounts.ip_limiter.blocked_for(f"ip:{ip}"), 0
+        )
+
+        with self.assertRaises(RateLimited):
+            self.accounts.login("alice", PW, ip)
+
     def test_lockout_expires(self):
         for _ in range(5):
             with self.assertRaises(AuthError):
@@ -168,18 +229,48 @@ class TestLoginAndSessions(unittest.TestCase):
 
 
 class TestRateLimiter(unittest.TestCase):
-    def test_window_and_key_cap(self):
+    def test_check_and_hit_is_atomic_under_concurrent_requests(self):
+        limiter = RateLimiter(5, 60, Clock(0))
+        barrier = threading.Barrier(20)
+
+        def attempt(_):
+            barrier.wait()
+            try:
+                limiter.check_and_hit("shared-account")
+                return True
+            except RateLimited:
+                return False
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            accepted = list(pool.map(attempt, range(20)))
+        self.assertEqual(sum(accepted), 5)
+        self.assertEqual(len(limiter._events["shared-account"]), 5)
+
+    def test_expired_key_cleanup_is_safe_and_reclaims_capacity(self):
         clock = Clock(0)
         limiter = RateLimiter(2, 10, clock, max_keys=3)
-        limiter.check_and_hit("a")
-        limiter.check_and_hit("a")
-        with self.assertRaises(RateLimited):
-            limiter.check_and_hit("a")
+        for key in "abc":
+            limiter.check_and_hit(key)
         clock.now = 11
-        limiter.check_and_hit("a")
-        for key in "bcdefg":                  # attacker-controlled keys cannot grow memory without bound
-            limiter.hit(key)
-        self.assertLessEqual(len(limiter._events), 3)
+        limiter.check_and_hit("new-key")
+        self.assertEqual(set(limiter._events), {"new-key"})
+
+    def test_key_cap_never_evicts_active_security_limits(self):
+        clock = Clock(0)
+        limiter = RateLimiter(2, 10, clock, max_keys=2)
+        limiter.check_and_hit("protected-account")
+        limiter.check_and_hit("protected-account")
+        limiter.check_and_hit("second-account")
+
+        # New attacker-controlled keys fail closed instead of evicting active keys.
+        with self.assertRaises(RateLimited):
+            limiter.check_and_hit("attacker-key-1")
+        with self.assertRaises(RateLimited):
+            limiter.hit("attacker-key-2")
+        self.assertEqual(set(limiter._events), {"protected-account", "second-account"})
+        self.assertEqual(len(limiter._events["protected-account"]), 2)
+        with self.assertRaises(RateLimited):
+            limiter.check_and_hit("protected-account")
 
 
 if __name__ == "__main__":
