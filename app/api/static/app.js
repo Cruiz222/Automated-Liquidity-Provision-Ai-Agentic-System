@@ -181,7 +181,7 @@ async function loadSecurity() {
     el("span", { class: "hint" }, "NGN withdrawals"), el("span", {}, "up to " + ngn(k.limits.NGN.max_amount_minor) + " each, " + ngn(k.limits.NGN.daily_cap_minor) + " per day"),
     el("span", { class: "hint" }, "USDT withdrawals"), el("span", {}, "up to " + usdt(k.limits.USDT.max_amount_minor) + " each, " + usdt(k.limits.USDT.daily_cap_minor) + " per day")));
   $("#kyc-basic").hidden = !(k.tier === 0 && k.status !== "pending"); $("#kyc-enhanced").hidden = !(k.tier === 1 && k.status !== "pending");
-  fill($("#email-status"), s.email ? s.email + (s.email_verified ? " (verified)" : " (not verified yet)") : "No email on file. Add one to enable password reset.");
+  fill($("#email-status"), (s.email ? s.email + (s.email_verified ? " (verified)" : " (not verified yet)") : "No email on file. Add one to enable password reset.") + (s.pending_email ? "\nPending change: " + s.pending_email + " (verify this address to complete the change)." : ""));
   fill($("#totp-status"), s.totp.enabled ? "On. A code from your authenticator app is required at login." : "Off.");
   $("#totp-begin").hidden = s.totp.enabled; $("#totp-disable").hidden = !s.totp.enabled;
   state.pinSet = s.pin.set; fill($("#pin-status"), s.pin.set ? "PIN is set." : "No PIN yet. Set one before your first transaction.");
@@ -318,9 +318,17 @@ const forms = {
   async pinResetConfirm(f) { await api("POST", "/api/security/pin/reset/confirm", { code: f.code.value.trim(), password: f.password.value, new_pin: f.pin.value }); f.reset(); $("#pin-reset").hidden = true; say("PIN reset."); await loadSecurity(); },
   async kycBasic(f) { await api("POST", "/api/kyc/basic", { full_name: f.fullname.value.trim(), bvn: f.bvn.value.trim() }); f.reset(); say("Identity verified" + simKyc() + ". Limits raised."); await loadSecurity(); },
   async kycEnhanced(f) { await api("POST", "/api/kyc/enhanced", { address: f.address.value.trim() }); f.reset(); say("Address verified" + simKyc() + "."); await loadSecurity(); },
-  async setEmail(f) { await api("POST", "/api/security/email", { email: f.email.value.trim() }); f.reset(); say("Verification code sent (in this simulation: server console and data/outbox.log)."); await loadSecurity(); },
+  async setEmail(f) { await api("POST", "/api/security/email", { email: f.email.value.trim(), password: f.password.value, ...(f.otp.value.trim() ? { otp: f.otp.value.trim() } : {}) }); f.reset(); say("Verification code sent (in this simulation: server console and data/outbox.log)."); await loadSecurity(); },
   async verifyEmail(f) { await api("POST", "/api/security/email/verify", { code: f.code.value.trim() }); f.reset(); say("Email verified."); await loadSecurity(); },
-  async totpConfirm(f) { await api("POST", "/api/security/totp/confirm", { code: f.code.value.trim() }); f.reset(); $("#totp-setup").hidden = true; say("Authenticator app turned on."); await loadSecurity(); },
+  async totpBegin(f) { const d = await api("POST", "/api/security/totp/begin", { password: f.password.value }); f.reset(); fill($("#totp-secret"), "Secret: " + d.secret + "\n\n" + d.otpauth_uri); $("#totp-setup").hidden = false; },
+  async totpConfirm(f) {
+    await api("POST", "/api/security/totp/confirm", { code: f.code.value.trim() });
+    f.reset();
+    fill($("#totp-secret"), "");
+    $("#totp-setup").hidden = true;
+    say("Authenticator app turned on.");
+    await loadSecurity();
+  },
   async totpDisable(f) { await api("POST", "/api/security/totp/disable", { password: f.password.value, code: f.code.value.trim() }); f.reset(); say("Authenticator app turned off."); await loadSecurity(); },
   async quote(f) {
     const c = f.source.value, q = await api("POST", "/api/quotes", { source_currency: c, amount_minor: parseAmount(f.amount.value, decimals(c)) });
@@ -370,9 +378,6 @@ $("#pin-forgot").addEventListener("click", () => guard(async () => {
   await api("POST", "/api/security/pin/reset/request", {}); $("#pin-reset").hidden = false; say("A code was sent to your verified email (in this simulation: the server console and data/outbox.log).");
 }));
 $("#show-reset").addEventListener("click", () => { $("#reset").hidden = !$("#reset").hidden; });
-$("#totp-begin").addEventListener("click", () => guard(async () => {
-  const d = await api("POST", "/api/security/totp/begin", {}); fill($("#totp-secret"), "Secret: " + d.secret + "\n\n" + d.otpauth_uri); $("#totp-setup").hidden = false;
-}));
 $("#more").addEventListener("click", () => guard(loadHistory));
 $("#logout").addEventListener("click", () => guard(async () => { await api("POST", "/api/auth/logout", {}); showAuth(); say("Logged out."); }));
 $("#logout-all").addEventListener("click", () => guard(async () => { await api("POST", "/api/auth/logout-all", {}); showAuth(); say("Signed out everywhere."); }));

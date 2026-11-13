@@ -132,7 +132,10 @@
       <form data-form="kycEnhanced" class="row" id="kyc-enhanced" hidden><label>Residential address <input name="address" maxlength="200" required></label><button type="submit">Submit address</button></form>
       <p class="hint">Simulation approves instantly. Your BVN is not stored; only its last four digits are kept. Higher tiers raise withdrawal limits.</p></div>
     <div class="card"><h2>Email</h2><div id="email-status"></div>
-      <form data-form="setEmail" class="row"><label>Email address <input name="email" type="email" maxlength="254" required></label><button type="submit">Send verification code</button></form>
+      <form data-form="setEmail" class="row"><label>New email address <input name="email" type="email" maxlength="254" required></label>
+        <label>Account password <input name="password" type="password" autocomplete="current-password" required></label>
+        <label>Authenticator code (if enabled) <input name="otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></label>
+        <button type="submit">Send verification code</button></form>
       <form data-form="verifyEmail" class="row"><label>Code <input name="code" inputmode="numeric" maxlength="8" required></label><button type="submit">Verify</button></form>
       <p class="hint">In this simulation, codes are written to the server console and data/outbox.log instead of being emailed.</p></div>
     <div class="card"><h2>Transaction PIN</h2><div id="pin-status"></div>
@@ -151,7 +154,8 @@
           <label>New PIN <input name="pin" type="password" inputmode="numeric" maxlength="6" autocomplete="off" required></label><button type="submit">Reset PIN</button></form></div>
       <p class="hint">You need a PIN before any transaction and enter it to confirm each one. It is separate from your password. A forgotten PIN is reset with a code sent to your verified email.</p></div>
     <div class="card"><h2>Authenticator app (optional)</h2><div id="totp-status"></div>
-      <button id="totp-begin">Set up an authenticator app</button>
+      <form data-form="totpBegin" class="row"><label>Account password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button id="totp-begin" type="submit">Set up an authenticator app</button></form>
       <div id="totp-setup" hidden><p class="hint">Add this secret to an authenticator app, then enter the 6-digit code it shows.</p>
         <pre id="totp-secret" class="pre"></pre>
         <form data-form="totpConfirm" class="row"><label>Code <input name="code" inputmode="numeric" maxlength="6" required></label><button type="submit">Turn on</button></form></div>
