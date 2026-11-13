@@ -269,11 +269,22 @@ class Api:
 
     def reset_confirm(self, c: Context) -> Any:
         body = fields(c.body, {"email": str, "code": str, "new_password": str})
-        c.service.accounts.reset_password(body["email"], body["code"], body["new_password"], c.ip)
+        try:
+            c.service.accounts.reset_password(
+                body["email"], body["code"], body["new_password"], c.ip
+            )
+        except (AuthError, ValidationError):
+            # Do not reveal whether an email belongs to a verified account.
+            raise ApiError(
+                400,
+                "invalid_reset",
+                "Invalid or expired reset request, or password does not meet requirements.",
+            ) from None
         return {"status": "password_reset", "all_sessions_revoked": True}
 
     def set_email(self, c: Context) -> Any:
-        c.service.accounts.set_email(c.user, fields(c.body, {"email": str})["email"], c.ip)
+        body = fields(c.body, {"email": str, "password": str}, {"otp": str})
+        c.service.accounts.set_email(c.user, body["email"], body["password"], body.get("otp"), c.ip)
         return {"status": "verification code sent"}
 
     def verify_email(self, c: Context) -> Any:
@@ -317,8 +328,8 @@ class Api:
         return c.service.close_position(c.user, c.params[0], c.key, body.get("pin"), c.ip)
 
     def totp_begin(self, c: Context) -> Any:
-        fields(c.body, {})
-        return c.service.accounts.totp_begin(c.user)
+        body = fields(c.body, {"password": str})
+        return c.service.accounts.totp_begin(c.user, body["password"], c.ip)
 
     def totp_confirm(self, c: Context) -> Any:
         c.service.accounts.totp_confirm(c.user, fields(c.body, {"code": str})["code"], c.ip)

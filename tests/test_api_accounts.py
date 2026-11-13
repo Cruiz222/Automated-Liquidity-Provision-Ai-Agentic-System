@@ -135,7 +135,7 @@ class TestKycLimits(ApiCase):
 
 class TestAuthenticatorOverHttp(ApiCase):
     def enable(self, client):
-        secret = client.post("/api/security/totp/begin")[1]["secret"]
+        secret = client.post("/api/security/totp/begin", {"password": PASSWORD})[1]["secret"]
         status, body, _ = client.post("/api/security/totp/confirm", {"code": totp.code_at(secret, totp.current_step(time.time()))})
         self.assertEqual(status, 200, body)
         self.assertNotIn("recovery", str(body).lower())
@@ -181,11 +181,33 @@ class TestAuthenticatorOverHttp(ApiCase):
         c = Client(self.server).register_login("bobby")
         self.assertEqual(c.post("/api/security/totp/confirm", {"code": "123456"})[0], 409)
         self.enable(c)
-        self.assertEqual(c.post("/api/security/totp/begin")[0], 409)
+        self.assertEqual(c.post("/api/security/totp/begin", {"password": PASSWORD})[0], 409)
+
+    def test_email_change_requires_password_and_current_totp_when_enabled(self):
+        secret = self.enable(self.alice)
+        self.assertEqual(self.alice.post("/api/security/email", {"email": "attacker@example.com"})[0], 400)
+        self.assertEqual(self.alice.post("/api/security/email", {"email": "attacker@example.com", "password": "wrong-password-1"})[0], 401)
+        self.assertEqual(self.alice.post("/api/security/email", {"email": "attacker@example.com", "password": PASSWORD,
+                                                                  "otp": "000000"})[0], 401)
+        status, body, _ = self.alice.post("/api/security/email", {"email": "alice-new@example.com", "password": PASSWORD,
+                                                                    "otp": self.code(secret)})
+        self.assertEqual(status, 200, body)
+        security = self.alice.get("/api/security")[1]
+        self.assertIsNone(security["email"])
+        self.assertEqual(security["pending_email"], "alice-new@example.com")
+        pending_code = self.mailer.sent[-1][2].split("code is ")[1][:8]
+        self.assertEqual(self.alice.post("/api/security/email/verify", {"code": pending_code})[0], 200)
+        self.assertEqual(self.alice.get("/api/security")[1]["email"], "alice-new@example.com")
+
+    def test_totp_enrollment_requires_current_password(self):
+        self.assertEqual(self.alice.post("/api/security/totp/begin", {})[0], 400)
+        self.assertEqual(self.alice.post("/api/security/totp/begin", {"password": "wrong-password-1"})[0], 401)
+        self.assertEqual(self.alice.post("/api/security/totp/begin", {"password": PASSWORD})[0], 200)
 
     def test_a_lost_phone_is_recovered_by_password_reset(self):
-        self.enable(self.alice)
-        self.alice.post("/api/security/email", {"email": "alice@example.com"})
+        secret = self.enable(self.alice)
+        self.alice.post("/api/security/email", {"email": "alice@example.com", "password": PASSWORD,
+                                                 "otp": self.code(secret)})
         self.alice.post("/api/security/email/verify", {"code": self.mailer.sent[-1][2].split("code is ")[1][:8]})
         guest = Client(self.server)
         guest.request("POST", "/api/auth/password-reset/request", {"email": "alice@example.com"})
@@ -240,7 +262,7 @@ class TestTransactionPinOverHttp(ApiCase):
         self.alice.pin = "593017"
         self.assertEqual(self.alice.post("/api/wallet/deposits", {"currency": "USDT", "amount_minor": 100}, key=True)[0], 200)
         self.assertEqual(self.alice.post("/api/security/pin/reset/request")[0], 400)                 # email not verified
-        self.alice.post("/api/security/email", {"email": "alice@example.com"})
+        self.alice.post("/api/security/email", {"email": "alice@example.com", "password": PASSWORD})
         self.alice.post("/api/security/email/verify", {"code": self.mailer.sent[-1][2].split("code is ")[1][:8]})
         self.assertEqual(self.alice.post("/api/security/pin/reset/request")[0], 200)
         code = self.mailer.sent[-1][2].split("code is ")[1][:8]
@@ -260,7 +282,7 @@ class TestEmailAndReset(ApiCase):
         return self.mailer.sent[-1][2].split("code is ")[1][:8]
 
     def test_verify_email_then_reset_password(self):
-        self.assertEqual(self.alice.post("/api/security/email", {"email": "alice@example.com"})[0], 200)
+        self.assertEqual(self.alice.post("/api/security/email", {"email": "alice@example.com", "password": PASSWORD})[0], 200)
         self.assertEqual(self.alice.post("/api/security/email/verify", {"code": "00000000"})[0], 401)
         self.assertEqual(self.alice.post("/api/security/email/verify", {"code": self.code()})[0], 200)
         self.assertTrue(self.alice.get("/api/security")[1]["email_verified"])
@@ -274,14 +296,131 @@ class TestEmailAndReset(ApiCase):
         self.assertEqual(guest.request("POST", "/api/auth/login", {"username": "alice", "password": PASSWORD})[0], 401)
         self.assertEqual(guest.request("POST", "/api/auth/login", {"username": "alice", "password": NEW_PASSWORD})[0], 200)
 
+    def test_email_change_keeps_old_verified_address_until_new_one_is_verified(self):
+        # Establish the original recovery address.
+        status, body, _ = self.alice.post(
+            "/api/security/email", {"email": "alice@example.com", "password": PASSWORD}
+        )
+        self.assertEqual(status, 200, body)
+        original_code = self.code()
+        self.assertEqual(self.alice.post("/api/security/email/verify", {"code": original_code})[0], 200)
+
+        # Request a change: the original verified address remains active.
+        status, body, _ = self.alice.post(
+            "/api/security/email", {"email": "alice-new@example.com", "password": PASSWORD}
+        )
+        self.assertEqual(status, 200, body)
+        status, security, _ = self.alice.get("/api/security")
+        self.assertEqual(status, 200)
+        self.assertEqual(security["email"], "alice@example.com")
+        self.assertTrue(security["email_verified"])
+        self.assertEqual(security["pending_email"], "alice-new@example.com")
+        self.assertEqual(self.mailer.sent[-1][0], "alice-new@example.com")
+        pending_code = self.code()
+
+        # The old address remains usable for password recovery while the change is pending.
+        guest = Client(self.server)
+        old_request = guest.request(
+            "POST", "/api/auth/password-reset/request", {"email": "alice@example.com"}
+        )
+        new_request = guest.request(
+            "POST", "/api/auth/password-reset/request", {"email": "alice-new@example.com"}
+        )
+        self.assertEqual(old_request[0], 200)
+        self.assertEqual(new_request[0], 200)
+        self.assertNotEqual(self.mailer.sent[-1][0], "alice-new@example.com")
+
+        # The new address becomes the recovery address only after its verification code succeeds.
+        self.assertEqual(
+            self.alice.post("/api/security/email/verify", {"code": pending_code})[0], 200
+        )
+        status, security, _ = self.alice.get("/api/security")
+        self.assertEqual(status, 200)
+        self.assertEqual(security["email"], "alice-new@example.com")
+        self.assertTrue(security["email_verified"])
+        self.assertIsNone(security["pending_email"])
+
+    def test_weak_password_does_not_consume_valid_reset_code(self):
+        guest = Client(self.server)
+        self.alice.post(
+            "/api/security/email",
+            {"email": "alice@example.com", "password": PASSWORD},
+        )
+        self.assertEqual(
+            self.alice.post(
+                "/api/security/email/verify", {"code": self.code()}
+            )[0],
+            200,
+        )
+        guest.request(
+            "POST",
+            "/api/auth/password-reset/request",
+            {"email": "alice@example.com"},
+        )
+
+        reset_code = self.code()
+        reset = {
+            "email": "alice@example.com",
+            "code": reset_code,
+            "new_password": "weak",
+        }
+
+        weak_response = guest.request(
+            "POST", "/api/auth/password-reset/confirm", reset
+        )
+        self.assertEqual(weak_response[0], 400)
+
+        valid_reset = {**reset, "new_password": NEW_PASSWORD}
+        successful_response = guest.request(
+            "POST", "/api/auth/password-reset/confirm", valid_reset
+        )
+        self.assertEqual(successful_response[0], 200)
+
     def test_reset_with_a_wrong_code_or_unverified_email_fails_uniformly(self):
         guest = Client(self.server)
-        self.alice.post("/api/security/email", {"email": "alice@example.com"})
+        self.alice.post("/api/security/email", {"email": "alice@example.com", "password": PASSWORD})
         body = {"email": "alice@example.com", "code": self.code(), "new_password": NEW_PASSWORD}
         unverified = guest.request("POST", "/api/auth/password-reset/confirm", body)
         nobody = guest.request("POST", "/api/auth/password-reset/confirm", {**body, "email": "nobody@example.com"})
         self.assertEqual((unverified[0], unverified[1]), (nobody[0], nobody[1]))
-        self.assertEqual(unverified[0], 401)
+        self.assertEqual(unverified[0], 400)
+
+    def test_reset_password_errors_do_not_reveal_verified_email_existence(self):
+        guest = Client(self.server)
+
+        self.alice.post(
+            "/api/security/email",
+            {"email": "alice@example.com", "password": PASSWORD},
+        )
+        self.assertEqual(
+            self.alice.post(
+                "/api/security/email/verify", {"code": self.code()}
+            )[0],
+            200,
+        )
+
+        known = guest.request(
+            "POST",
+            "/api/auth/password-reset/confirm",
+            {
+                "email": "alice@example.com",
+                "code": "00000000",
+                "new_password": "weak",
+            },
+        )
+        unknown = guest.request(
+            "POST",
+            "/api/auth/password-reset/confirm",
+            {
+                "email": "nobody@example.com",
+                "code": "00000000",
+                "new_password": "weak",
+            },
+        )
+
+        self.assertEqual((known[0], known[1]), (unknown[0], unknown[1]))
+        self.assertEqual(known[0], 400)
+        self.assertEqual(known[1]["error"]["code"], "invalid_reset")
 
     def test_registration_accepts_an_optional_email(self):
         c = Client(self.server)

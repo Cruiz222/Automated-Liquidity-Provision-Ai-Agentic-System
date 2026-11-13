@@ -30,7 +30,7 @@ class LiveApiCase(unittest.TestCase):
 
     def qualified(self, name):
         c = Client(self.server).register_login(name)
-        self.assertEqual(c.post("/api/security/email", {"email": f"{name}@example.com"})[0], 200)
+        self.assertEqual(c.post("/api/security/email", {"email": f"{name}@example.com", "password": PASSWORD})[0], 200)
         self.assertEqual(c.post("/api/security/email/verify", {"code": self.mailer.sent[-1][2].split("code is ")[1][:8]})[0], 200)
         c.verify_kyc()
         self.assertEqual(c.post("/api/live/terms", {"pin": PIN})[0], 200)
@@ -148,7 +148,7 @@ class TestLiveDepositsAndPayoutsOverHttp(LiveApiCase):
         self.addCleanup(server.stop)
         mailer = server.service.accounts.mailer = MemoryMailer()
         c = Client(server).register_login("dora")
-        c.post("/api/security/email", {"email": "dora@example.com"})
+        c.post("/api/security/email", {"email": "dora@example.com", "password": PASSWORD})
         c.post("/api/security/email/verify", {"code": mailer.sent[-1][2].split("code is ")[1][:8]})
         c.verify_kyc()
         c.post("/api/live/terms", {"pin": PIN})
