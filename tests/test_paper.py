@@ -34,6 +34,10 @@ class PaperTests(unittest.TestCase):
         self.addCleanup(self.runner.close)
         self.old = (1, 999, 'sell', 99, 1)
 
+    def test_paper_run_directory_has_restricted_permissions(self):
+        mode = self.store.directory.stat().st_mode & 0o777
+        self.assertEqual(mode & 0o077, 0)
+
     def bootstrap(self):
         self.assertTrue(self.runner.ingest(payload(1000, [self.old])))
         self.assertEqual(self.runner.snapshot()['feed']['status'], 'synchronizing')

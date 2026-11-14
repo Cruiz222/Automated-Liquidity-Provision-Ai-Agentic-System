@@ -10,7 +10,7 @@ from .market_data import COLUMNS
 class PaperStore:
     def __init__(self, directory, metadata):
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=False)
+        self.directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         self.db = sqlite3.connect(self.directory / 'paper.sqlite3', check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
