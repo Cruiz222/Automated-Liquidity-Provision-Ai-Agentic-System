@@ -471,6 +471,42 @@ class TestMailersAndFiles(unittest.TestCase):
             ledger.close()
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
+    def test_database_rejects_symbolic_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.sqlite3"
+            target.write_bytes(b"")
+            target.chmod(0o600)
+
+            link = Path(tmp) / "platform.sqlite3"
+            link.symlink_to(target)
+
+            with self.assertRaises(PermissionError):
+                WalletLedger(link)
+
+    def test_database_rejects_non_regular_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "platform.sqlite3"
+            path.mkdir()
+
+            with self.assertRaises(PermissionError):
+                WalletLedger(path)
+
+    def test_database_permission_failure_stops_initialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "platform.sqlite3"
+
+            with mock.patch(
+                "app.ledger.wallet_ledger.os.fchmod",
+                side_effect=PermissionError("permission denied"),
+            ):
+                with mock.patch(
+                    "app.ledger.wallet_ledger.sqlite3.connect"
+                ) as connect:
+                    with self.assertRaises(PermissionError):
+                        WalletLedger(path)
+
+                    connect.assert_not_called()
+
 
 
 class TestLoadSecret(unittest.TestCase):

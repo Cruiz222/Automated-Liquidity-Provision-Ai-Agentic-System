@@ -18,9 +18,12 @@ withdrawals) and ``fees`` (platform revenue).
 """
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 import sqlite3
+import stat
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -117,6 +120,53 @@ def _validate_destination(currency: str, destination: Any) -> dict[str, str]:
     return {"network": network, "address": address}
 
 
+def _secure_database_file(database: str) -> None:
+    """Create or secure a SQLite database before SQLite opens it."""
+    path = Path(database)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow | nonblock)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | nonblock,
+                0o600,
+            )
+        except FileExistsError:
+            descriptor = os.open(
+                path, os.O_RDONLY | nofollow | nonblock
+            )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PermissionError(
+                "database path must not be a symbolic link"
+            ) from exc
+        raise
+
+    try:
+        info = os.fstat(descriptor)
+
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError("database path must be a regular file")
+
+        if info.st_uid != os.geteuid():
+            raise PermissionError(
+                "database file must be owned by the application user"
+            )
+
+        os.fchmod(descriptor, 0o600)
+
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+            raise PermissionError(
+                "could not enforce owner-only database permissions"
+            )
+    finally:
+        os.close(descriptor)
+
+
 class WalletLedger:
     """SQLite-backed wallet balances derived from immutable ledger entries."""
 
@@ -130,12 +180,14 @@ class WalletLedger:
             self.withdrawal_limits[currency] = limits
         self._lock = threading.RLock()
         self.lock = self._lock          # shared by services that use this connection
-        self.db = sqlite3.connect(self.database, check_same_thread=False, isolation_level=None)
         if self.database != ":memory:":
-            try:
-                Path(self.database).chmod(0o600)        # owner-only: the file holds balances, hashes and 2FA secrets
-            except OSError:
-                pass
+            _secure_database_file(self.database)
+
+        self.db = sqlite3.connect(
+            self.database,
+            check_same_thread=False,
+            isolation_level=None,
+        )
         self.db.row_factory = sqlite3.Row
         with self._lock:
             self.db.execute("PRAGMA foreign_keys = ON")
