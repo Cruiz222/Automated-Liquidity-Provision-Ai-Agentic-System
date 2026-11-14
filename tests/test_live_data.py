@@ -110,12 +110,21 @@ class TestDefiLlamaProvider(unittest.TestCase):
         eth = next(p for p in self.provider().fetch_pools() if p.pool_id == "id-eth-usdc")
         self.assertEqual((eth.chain, eth.dex, eth.token0, eth.token1), ("arbitrum", "uniswap-v3", "WETH", "USDC"))
         self.assertEqual(eth.fee_tier_bps, 5.0)
-        self.assertAlmostEqual(eth.reported_fee_apr, 0.09)                      # the lower of 12% and 9%
+        self.assertAlmostEqual(eth.reported_fee_apr, 0.09)                      # trusted project's conservative base-APY estimate
+        self.assertAlmostEqual(eth.reported_base_apy, 0.09)
         self.assertEqual((eth.volume_usd_1d, eth.volume_usd_7d), (80e6, 400e6))
         self.assertEqual(eth.token_addresses, (WETH, USDC))
         self.assertEqual((eth.price0_usd, eth.price1_usd), (3000.0, 1.0))
         self.assertEqual(eth.as_of, NOW)
         self.assertIn("defillama", eth.source)
+
+    def test_empty_fee_apr_allowlist_keeps_base_apy_untrusted(self):
+        provider = DefiLlamaPoolProvider(
+            PoolUniverse(fee_apr_projects=()), make_fetch(), clock=lambda: NOW
+        )
+        eth = next(p for p in provider.fetch_pools() if p.pool_id == "id-eth-usdc")
+        self.assertAlmostEqual(eth.reported_base_apy, 0.09)
+        self.assertIsNone(eth.reported_fee_apr)
 
     def test_price_history_is_the_token_ratio_aligned_by_time(self):
         eth = next(p for p in self.provider().fetch_pools() if p.pool_id == "id-eth-usdc")

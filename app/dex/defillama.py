@@ -33,6 +33,9 @@ CHAIN_PREFIX = {"ethereum": "ethereum", "arbitrum": "arbitrum", "base": "base", 
 DEFAULT_CHAINS = ("ethereum", "arbitrum", "base", "polygon", "optimism")
 # Two-token AMM projects whose pools the full-range model approximates. v3-style pools are flagged by the selector.
 DEFAULT_PROJECTS = ("uniswap-v2", "uniswap-v3", "sushiswap", "aerodrome-v1", "aerodrome-slipstream", "pancakeswap-amm")
+# Projects whose DefiLlama base APY is treated as a fee-APR estimate. Keep
+# this separate from the broader pool universe and review it deliberately.
+DEFAULT_FEE_APR_PROJECTS = DEFAULT_PROJECTS
 DEFAULT_TOKENS = frozenset({"USDC", "USDT", "DAI", "WETH", "ETH", "WBTC", "CBBTC", "STETH", "WSTETH", "CBETH", "RETH"})
 MIN_PRICE_CONFIDENCE = 0.8
 BATCH = 30                                   # coins per current-price request
@@ -51,6 +54,7 @@ class PoolUniverse:
     history_period: str = "1d"
     history_points: int | None = None
     history_alignment_tolerance_seconds: float | None = None
+    fee_apr_projects: tuple[str, ...] = DEFAULT_FEE_APR_PROJECTS
 
     def __post_init__(self) -> None:
         if self.history_days < 1:
@@ -500,7 +504,12 @@ class DefiLlamaPoolProvider:
         if not isinstance(rows, list):
             raise ProviderError("pool list response has no 'data' list")
         chosen = self._eligible_rows(rows)
-        snapshots = parse_defillama_pools({"data": chosen}, as_of=self._clock(), min_tvl_usd=self.universe.min_tvl_usd)
+        snapshots = parse_defillama_pools(
+            {"data": chosen},
+            as_of=self._clock(),
+            min_tvl_usd=self.universe.min_tvl_usd,
+            fee_apr_projects=self.universe.fee_apr_projects,
+        )
         if not snapshots:
             raise ProviderError("no pool passed the universe filter; check the chain, project and token settings")
         ids = [i for s in snapshots if (pair := self._coin_ids(s)) for i in pair]

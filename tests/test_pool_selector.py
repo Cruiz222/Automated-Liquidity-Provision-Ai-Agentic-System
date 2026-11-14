@@ -47,6 +47,15 @@ class TestEvaluation(unittest.TestCase):
         self.assertAlmostEqual(ev.fee_apr, 0.01)
         self.assertTrue(any("differ" in w for w in ev.warnings))
 
+    def test_base_apy_alone_is_not_used_as_fee_apr(self):
+        snap = dataclasses.replace(
+            by_id(SNAPSHOTS, "weth-usdc-arbitrum-5bp"),
+            fee_tier_bps=None, reported_fee_apr=None, reported_base_apy=0.20,
+        )
+        ev = selector().evaluate(snap, NOW)
+        self.assertEqual(ev.fee_apr, 0.0)
+        self.assertTrue(any("fee data" in reason for reason in ev.reasons))
+
     def test_uncorrelated_pairs_need_stronger_fee_coverage(self):
         snap = dataclasses.replace(by_id(SNAPSHOTS, "weth-usdc-arbitrum-5bp"),
                                    volume_usd_1d=30e6, volume_usd_7d=210e6)

@@ -79,6 +79,7 @@ class PoolSnapshot:
     price0_as_of: float | None = None
     price1_as_of: float | None = None
     history_interval_seconds: float | None = None
+    reported_base_apy: float | None = None  # source-reported base APY; not necessarily LP fee yield
 
     def __post_init__(self) -> None:
         if not self.pool_id or not isinstance(self.pool_id, str):
@@ -90,7 +91,7 @@ class PoolSnapshot:
             raise ValueError("tvl_usd must be a positive number")
         if self.fee_tier_bps is not None and (not _finite(self.fee_tier_bps) or not 0 <= self.fee_tier_bps < 10_000):
             raise ValueError("fee_tier_bps must be in [0, 10000)")
-        for name in ("volume_usd_1d", "volume_usd_7d", "reported_fee_apr"):
+        for name in ("volume_usd_1d", "volume_usd_7d", "reported_fee_apr", "reported_base_apy"):
             value = getattr(self, name)
             if value is not None and (not _finite(value) or value < 0):
                 raise ValueError(f"{name} must be a non-negative number")
@@ -192,7 +193,7 @@ def with_price_history(snapshot: PoolSnapshot, prices: Iterable[float]) -> PoolS
 _FIELDS = ("pool_id", "chain", "dex", "token0", "token1", "tvl_usd", "fee_tier_bps", "volume_usd_1d",
            "volume_usd_7d", "price_history", "price_observations", "reported_fee_apr", "correlation", "audited", "age_days",
            "price0_usd", "price1_usd", "token_addresses", "as_of", "source",
-           "price0_as_of", "price1_as_of", "history_interval_seconds")
+           "price0_as_of", "price1_as_of", "history_interval_seconds", "reported_base_apy")
 
 
 def load_snapshots(path: str | Path) -> tuple[list[PoolSnapshot], dict[str, Any]]:
@@ -224,7 +225,10 @@ def load_snapshots(path: str | Path) -> tuple[list[PoolSnapshot], dict[str, Any]
 _FEE_TIER = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
-def parse_defillama_pools(payload: dict[str, Any], as_of: float, min_tvl_usd: float = 0.0) -> list[PoolSnapshot]:
+def parse_defillama_pools(
+    payload: dict[str, Any], as_of: float, min_tvl_usd: float = 0.0,
+    fee_apr_projects: Iterable[str] = (),
+) -> list[PoolSnapshot]:
     """Convert a DefiLlama yields response (``{"data": [...]}``) into two-token pool snapshots.
 
     Only two-token pools are kept. Field names follow DefiLlama's public yields
@@ -232,7 +236,10 @@ def parse_defillama_pools(payload: dict[str, Any], as_of: float, min_tvl_usd: fl
     ``volumeUsd1d``, ``volumeUsd7d``, ``poolMeta``); rows that do not parse are
     skipped. Verify against a live response before relying on it. The source
     gives no price history, so volatile pools need :func:`with_price_history`.
+    ``apyBase`` is retained as base APY, but is promoted to fee APR only when
+    the row project is explicitly included in ``fee_apr_projects``.
     """
+    trusted_fee_projects = {str(project).strip().lower() for project in fee_apr_projects}
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise ValueError("payload must contain a 'data' list")
@@ -248,17 +255,19 @@ def parse_defillama_pools(payload: dict[str, Any], as_of: float, min_tvl_usd: fl
         fee_match = _FEE_TIER.search(str(row.get("poolMeta") or ""))
         apy_candidates = [v for v in (row.get("apyBase"), row.get("apyBase7d")) if _finite(v) and v >= 0]
         apy_base = min(apy_candidates) if apy_candidates else None          # the lower of the 1-day and 7-day base APY
+        project = str(row.get("project", "")).strip().lower() or "unknown"
         addresses = row.get("underlyingTokens")
         addresses = tuple(a for a in addresses if isinstance(a, str)) if isinstance(addresses, list) else ()
         try:
             snapshots.append(PoolSnapshot(
                 pool_id=str(pool_id), chain=str(row.get("chain", "")).lower() or "unknown",
-                dex=str(row.get("project", "")) or "unknown", token0=tokens[0], token1=tokens[1],
+                dex=project, token0=tokens[0], token1=tokens[1],
                 tvl_usd=float(tvl),
                 fee_tier_bps=float(fee_match.group(1)) * 100 if fee_match else None,
                 volume_usd_1d=row.get("volumeUsd1d") if _finite(row.get("volumeUsd1d")) else None,
                 volume_usd_7d=row.get("volumeUsd7d") if _finite(row.get("volumeUsd7d")) else None,
-                reported_fee_apr=apy_base / 100.0 if apy_base is not None else None,
+                reported_fee_apr=(apy_base / 100.0 if apy_base is not None and project in trusted_fee_projects else None),
+                reported_base_apy=apy_base / 100.0 if apy_base is not None else None,
                 token_addresses=addresses if len(addresses) == 2 else (),
                 as_of=as_of, source="defillama"))
         except ValueError:

@@ -80,12 +80,21 @@ class TestDefiLlama(unittest.TestCase):
     ]}
 
     def test_parses_two_token_pools_only(self):
-        snapshots = parse_defillama_pools(self.PAYLOAD, as_of=123.0, min_tvl_usd=1000)
+        snapshots = parse_defillama_pools(
+            self.PAYLOAD, as_of=123.0, min_tvl_usd=1000,
+            fee_apr_projects=("uniswap-v3",),
+        )
         self.assertEqual([s.pool_id for s in snapshots], ["abc"])
         snap = snapshots[0]
         self.assertEqual((snap.chain, snap.dex, snap.fee_tier_bps), ("arbitrum", "uniswap-v3", 5.0))
         self.assertAlmostEqual(snap.reported_fee_apr, 0.12)
+        self.assertAlmostEqual(snap.reported_base_apy, 0.12)
         self.assertEqual(snap.source, "defillama")
+
+    def test_untrusted_base_apy_is_not_promoted_to_fee_apr(self):
+        snap = parse_defillama_pools(self.PAYLOAD, as_of=123.0)[0]
+        self.assertAlmostEqual(snap.reported_base_apy, 0.12)
+        self.assertIsNone(snap.reported_fee_apr)
 
     def test_bad_payload(self):
         with self.assertRaises(ValueError):
