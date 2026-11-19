@@ -1,4 +1,7 @@
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 
 from app.ledger import (
     CurrencyLimits, IdempotencyConflict, InsufficientFunds, InvalidOperation, InvalidTransition,
@@ -199,6 +202,61 @@ class TestWithdrawals(LedgerCase):
         self.ledger.request_withdrawal("u1", "NGN", 1_000_000, BANK, "w1")
         self.assertEqual(len(self.ledger.list_withdrawals("u1")), 1)
         self.assertEqual(self.ledger.list_withdrawals("u1", status="completed"), [])
+
+
+class TestWithdrawalMigration(unittest.TestCase):
+    def test_legacy_withdrawals_and_index_survive_submission_status_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy.sqlite3"
+
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                CREATE TABLE withdrawals (
+                    withdrawal_id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
+                    currency TEXT NOT NULL CHECK(currency IN ('NGN', 'USDT')),
+                    amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+                    fee_minor INTEGER NOT NULL CHECK(fee_minor >= 0),
+                    destination_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+                    provider_ref TEXT,
+                    reason TEXT NOT NULL DEFAULT '',
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX idx_withdrawals_account
+                    ON withdrawals(account, currency, status);
+                INSERT INTO withdrawals (
+                    withdrawal_id, account, currency, amount_minor, fee_minor,
+                    destination_json, status, provider_ref, reason, idempotency_key
+                ) VALUES (
+                    'wd:legacy-1', 'u1', 'NGN', 100000, 5000,
+                    '{"account_number":"0123456789","bank_code":"058"}',
+                    'pending', NULL, '', 'legacy-1'
+                );
+            """)
+            connection.close()
+
+            migrated = WalletLedger(database)
+            self.addCleanup(migrated.close)
+
+            row = migrated.get_withdrawal("wd:legacy-1")
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(row["amount_minor"], 100000)
+            self.assertEqual(row["fee_minor"], 5000)
+            self.assertEqual(row["idempotency_key"], "legacy-1")
+
+            index = migrated.db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_withdrawals_account'"
+            ).fetchone()
+            self.assertIsNotNone(index)
+
+            claimed, updated = migrated.claim_withdrawal_submission("wd:legacy-1")
+            self.assertTrue(claimed)
+            self.assertEqual(updated["status"], "submitting")
 
 
 if __name__ == "__main__":

@@ -542,19 +542,47 @@ class PlatformService:
         return self._decorate_withdrawal(result)
 
     def _dispatch_live_payout(self, user_id: str, withdrawal: dict[str, Any]) -> dict[str, Any]:
-        """Hand a held withdrawal to the rail. If the rail refuses, the hold is released in full."""
+        """Claim a withdrawal before dispatch so concurrent requests cannot send it twice."""
         if withdrawal["status"] != "pending":
-            return withdrawal                                            # a replay of an already-dispatched request
-        adapter = self.rails if withdrawal["currency"] == "NGN" else self.chain
-        wid = withdrawal["withdrawal_id"]
+            return withdrawal
+
+        claimed, current = self.ledger.claim_withdrawal_submission(withdrawal["withdrawal_id"])
+        if not claimed:
+            return self._decorate_withdrawal(current)
+
+        wid = current["withdrawal_id"]
+        adapter = self.rails if current["currency"] == "NGN" else self.chain
+
+        if adapter is None:
+            self.ledger.fail_withdrawal(wid, "no payout rail is configured")
+            raise ProviderError("no rail is configured for this currency; your funds were returned")
+
         try:
-            if adapter is None:
-                raise ProviderError("no rail is configured for this currency")
-            external = adapter.send_payout(withdrawal) if withdrawal["currency"] == "NGN" else adapter.send_usdt(withdrawal)
-        except Exception as error:      # noqa: BLE001 - any rail failure must release the funds
-            self.ledger.fail_withdrawal(wid, "payout rail error")
-            self.accounts.audit(user_id, "withdrawal_rail_error", withdrawal_id=wid, error=type(error).__name__)
-            raise ProviderError("the payout could not be sent; your funds were returned") from error
+            external = (
+                adapter.send_payout(current)
+                if current["currency"] == "NGN"
+                else adapter.send_usdt(current)
+            )
+            if not isinstance(external, str) or not external:
+                raise ProviderError("payout adapter returned an invalid provider reference")
+        except Exception as error:  # noqa: BLE001 - provider outcome depends on adapter type
+            self.accounts.audit(
+                user_id, "withdrawal_rail_error",
+                withdrawal_id=wid, error=type(error).__name__,
+            )
+
+            if getattr(adapter, "sandbox", False):
+                self.ledger.fail_withdrawal(wid, "sandbox payout rail error")
+                raise ProviderError(
+                    "the sandbox payout failed; your funds were returned"
+                ) from error
+
+            # A real provider may have accepted the payout before a timeout or
+            # connection failure. Keep the funds held for provider reconciliation.
+            raise ProviderError(
+                "the payout outcome is uncertain; funds remain reserved while it is reconciled"
+            ) from error
+
         return self._decorate_withdrawal(self.ledger.mark_withdrawal_processing(wid, external))
 
     def _decorate_withdrawal(self, row: dict[str, Any]) -> dict[str, Any]:

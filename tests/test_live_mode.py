@@ -263,6 +263,30 @@ class FailingRail(SandboxPaymentRail):
         raise RuntimeError("bank is down")
 
 
+class BlockingRail(SandboxPaymentRail):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self.calls_lock = threading.Lock()
+
+    def send_payout(self, withdrawal):
+        with self.calls_lock:
+            self.calls += 1
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test timed out waiting for release")
+        return f"blocking-{withdrawal['withdrawal_id']}"
+
+
+class UncertainRail(SandboxPaymentRail):
+    sandbox = False
+
+    def send_payout(self, withdrawal):
+        raise RuntimeError("connection lost after request was sent")
+
+
 class FailingChain(SandboxChainExecutor):
     def __init__(self, *a):
         super().__init__(*a)
@@ -283,6 +307,78 @@ class TestLiveWithdrawals(LiveCase):
     def request(self, uid, amount=4_000_000, key="live-wd-0001"):
         with self.service.use_mode("live", uid):
             return self.service.request_withdrawal(uid, "NGN", amount, {"account_number": ACCOUNT}, key, pin=PIN)
+
+    def test_concurrent_dispatch_calls_the_payout_adapter_once(self):
+        rail = BlockingRail(SECRET.encode())
+        service = self.make(rails=rail, chain=SandboxChainExecutor(SECRET.encode()))
+        uid = self.user()
+        self.fund_live_ngn(uid)
+
+        with service.use_mode("live", uid):
+            withdrawal = service.ledger.request_withdrawal(
+                uid, "NGN", 4_000_000,
+                {"bank_code": "058", "account_number": ACCOUNT},
+                "concurrent-withdrawal",
+            )
+
+        results = []
+        errors = []
+
+        def dispatch():
+            try:
+                with service.use_mode("live", uid):
+                    results.append(service._dispatch_live_payout(uid, withdrawal))
+            except Exception as error:
+                errors.append(error)
+
+        first = threading.Thread(target=dispatch)
+        first.start()
+        self.assertTrue(rail.started.wait(timeout=5))
+
+        # The first caller has claimed the withdrawal and is waiting in the adapter.
+        # A second caller must observe "submitting" and must not call the adapter.
+        second = threading.Thread(target=dispatch)
+        second.start()
+        second.join(timeout=5)
+
+        rail.release.set()
+        first.join(timeout=5)
+
+        self.assertFalse(first.is_alive(), "first dispatch thread did not finish")
+        self.assertFalse(second.is_alive(), "second dispatch thread did not finish")
+        self.assertEqual(errors, [])
+        self.assertEqual(rail.calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {result["status"] for result in results},
+            {"submitting", "processing"},
+        )
+        with service.use_mode("live", uid):
+            self.assertEqual(
+                service.ledger.get_withdrawal(withdrawal["withdrawal_id"])["status"],
+                "processing",
+            )
+            self.assertTrue(service.ledger.reconcile()["ok"])
+
+    def test_uncertain_real_provider_outcome_keeps_funds_reserved(self):
+        service = self.make(
+            rails=UncertainRail(SECRET.encode()),
+            chain=SandboxChainExecutor(SECRET.encode()),
+        )
+        uid = self.user()
+        self.fund_live_ngn(uid)
+
+        with self.assertRaises(ProviderError):
+            self.request(uid)
+
+        with service.use_mode("live", uid):
+            withdrawal = service.withdrawals(uid)[0]
+            self.assertEqual(withdrawal["status"], "submitting")
+            self.assertEqual(
+                service.ledger.balance("withdrawal-hold", "NGN"),
+                withdrawal["amount_minor"] + withdrawal["fee_minor"],
+            )
+            self.assertTrue(service.ledger.reconcile()["ok"])
 
     def test_withdrawal_goes_to_the_rail_and_completes_by_webhook(self):
         service = self.make()

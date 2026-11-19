@@ -87,6 +87,58 @@ def ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) 
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def migrate_withdrawal_submission_status(db: sqlite3.Connection) -> None:
+    """Allow the durable submitting state without discarding existing withdrawals."""
+    schema = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'withdrawals'"
+    ).fetchone()
+    if schema is None or "submitting" in (schema["sql"] or ""):
+        return
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("""
+            CREATE TABLE withdrawals_new (
+                withdrawal_id TEXT PRIMARY KEY,
+                account TEXT NOT NULL,
+                currency TEXT NOT NULL CHECK(currency IN ('NGN', 'USDT')),
+                amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+                fee_minor INTEGER NOT NULL CHECK(fee_minor >= 0),
+                destination_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN
+                    ('pending', 'submitting', 'processing', 'completed', 'failed', 'cancelled')),
+                provider_ref TEXT,
+                reason TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.execute("""
+            INSERT INTO withdrawals_new (
+                withdrawal_id, account, currency, amount_minor, fee_minor,
+                destination_json, status, provider_ref, reason, idempotency_key,
+                created_at, updated_at
+            )
+            SELECT
+                withdrawal_id, account, currency, amount_minor, fee_minor,
+                destination_json, status, provider_ref, reason, idempotency_key,
+                created_at, updated_at
+            FROM withdrawals
+        """)
+        db.execute("DROP TABLE withdrawals")
+        db.execute("ALTER TABLE withdrawals_new RENAME TO withdrawals")
+        db.execute("""
+            CREATE INDEX idx_withdrawals_account
+            ON withdrawals(account, currency, status)
+        """)
+        db.execute("COMMIT")
+    except BaseException:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+
+
 def _positive_int(value: int, field: str = "amount") -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise InvalidOperation(f"{field} must be a positive integer in minor units")
@@ -247,6 +299,7 @@ class WalletLedger:
                 CREATE INDEX IF NOT EXISTS idx_withdrawals_account
                     ON withdrawals(account, currency, status);
             """)
+            migrate_withdrawal_submission_status(self.db)
 
     def close(self) -> None:
         with self._lock:
@@ -401,7 +454,7 @@ class WalletLedger:
                 held = self.balance("withdrawal-hold", currency)
                 expected = self.db.execute(
                     "SELECT COALESCE(SUM(amount_minor + fee_minor), 0) FROM withdrawals "
-                    "WHERE currency = ? AND status IN ('pending', 'processing')", (currency,)
+                    "WHERE currency = ? AND status IN ('pending', 'submitting', 'processing')", (currency,)
                 ).fetchone()[0]
                 if held != expected:
                     problems.append(f"withdrawal-hold {currency} is {held}, open withdrawals total {expected}")
@@ -572,7 +625,8 @@ class WalletLedger:
                 raise LimitExceeded(f"maximum withdrawal is {limits.max_amount_minor} {currency} minor units")
             used = self.db.execute(
                 "SELECT COALESCE(SUM(amount_minor), 0) FROM withdrawals WHERE account = ? AND currency = ? "
-                "AND status IN ('pending', 'processing', 'completed') AND date(created_at) = date('now')",
+                "AND status IN ('pending', 'submitting', 'processing', 'completed') "
+                "AND date(created_at) = date('now')",
                 (account, currency)).fetchone()[0]
             if used + amount_minor > limits.daily_cap_minor:
                 raise LimitExceeded(f"daily {currency} withdrawal cap of {limits.daily_cap_minor} would be exceeded")
@@ -594,6 +648,31 @@ class WalletLedger:
                  json.dumps(dest, sort_keys=True), idempotency_key))
             return self.get_withdrawal(withdrawal_id)
 
+    def claim_withdrawal_submission(self, withdrawal_id: str) -> tuple[bool, dict[str, Any]]:
+        """Atomically claim a pending withdrawal before contacting its payout provider.
+
+        Only one caller can change pending to submitting. Other callers receive
+        the current row with claimed=False and must not dispatch it again.
+        """
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ?", (withdrawal_id,)
+            ).fetchone()
+            if row is None:
+                raise InvalidOperation("unknown withdrawal")
+            if row["status"] != "pending":
+                return False, self._withdrawal_dict(row)
+
+            self.db.execute(
+                "UPDATE withdrawals SET status = 'submitting', updated_at = CURRENT_TIMESTAMP "
+                "WHERE withdrawal_id = ? AND status = 'pending'",
+                (withdrawal_id,),
+            )
+            updated = self.db.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id = ?", (withdrawal_id,)
+            ).fetchone()
+            return True, self._withdrawal_dict(updated)
+
     def mark_withdrawal_processing(self, withdrawal_id: str, provider_ref: str) -> dict[str, Any]:
         """Record that the payout provider accepted the payout (required before completion)."""
         if not provider_ref or not isinstance(provider_ref, str):
@@ -604,7 +683,7 @@ class WalletLedger:
                 raise InvalidOperation("unknown withdrawal")
             if row["status"] == "processing" and row["provider_ref"] == provider_ref:
                 return self._withdrawal_dict(row)
-            if row["status"] != "pending":
+            if row["status"] not in ("pending", "submitting"):
                 raise InvalidTransition(f"withdrawal is {row['status']}")
             self.db.execute("UPDATE withdrawals SET status = 'processing', provider_ref = ?, "
                             "updated_at = CURRENT_TIMESTAMP WHERE withdrawal_id = ?", (provider_ref, withdrawal_id))
@@ -644,7 +723,9 @@ class WalletLedger:
 
     def fail_withdrawal(self, withdrawal_id: str, reason: str = "") -> dict[str, Any]:
         """The provider failed the payout: return amount and fee to the customer."""
-        return self._finish_withdrawal(withdrawal_id, "fail", ("pending", "processing"), "failed", reason)
+        return self._finish_withdrawal(
+            withdrawal_id, "fail", ("pending", "submitting", "processing"), "failed", reason
+        )
 
     def cancel_withdrawal(self, withdrawal_id: str, reason: str = "") -> dict[str, Any]:
         """Customer cancellation, allowed only before the provider has accepted the payout."""
