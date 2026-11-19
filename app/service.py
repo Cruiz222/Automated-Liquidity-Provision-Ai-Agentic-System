@@ -247,8 +247,57 @@ class PlatformService:
                           else RateService([NoRateSource()], max_age_seconds=60, clock=clock))
             self.books["live"] = self._make_book(live_ledger, live_rates)
             with live_ledger.transaction():
-                live_ledger.db.execute("CREATE TABLE IF NOT EXISTS webhook_events (event_id TEXT PRIMARY KEY, source TEXT NOT NULL, "
-                                       "received_at REAL NOT NULL)")
+                db = live_ledger.db
+                table_exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'webhook_events'"
+                ).fetchone()
+
+                if not table_exists:
+                    db.execute("""
+                        CREATE TABLE webhook_events (
+                            event_id TEXT NOT NULL,
+                            source TEXT NOT NULL,
+                            received_at REAL NOT NULL,
+                            PRIMARY KEY (source, event_id)
+                        )
+                    """)
+                else:
+                    columns = db.execute("PRAGMA table_info(webhook_events)").fetchall()
+                    required_columns = {"event_id", "source", "received_at"}
+                    existing_columns = {row["name"] for row in columns}
+                    missing_columns = required_columns - existing_columns
+
+                    if missing_columns:
+                        missing = ", ".join(sorted(missing_columns))
+                        raise RuntimeError(
+                            f"cannot migrate webhook_events: missing required columns: {missing}"
+                        )
+
+                    primary_key = [
+                        row["name"]
+                        for row in sorted(columns, key=lambda row: row["pk"])
+                        if row["pk"] > 0
+                    ]
+
+                    if primary_key != ["source", "event_id"]:
+                        db.execute("DROP TABLE IF EXISTS webhook_events_new")
+                        db.execute("""
+                            CREATE TABLE webhook_events_new (
+                                event_id TEXT NOT NULL,
+                                source TEXT NOT NULL,
+                                received_at REAL NOT NULL,
+                                PRIMARY KEY (source, event_id)
+                            )
+                        """)
+                        db.execute("""
+                            INSERT INTO webhook_events_new (event_id, source, received_at)
+                            SELECT event_id, source, received_at
+                            FROM webhook_events
+                        """)
+                        db.execute("DROP TABLE webhook_events")
+                        db.execute(
+                            "ALTER TABLE webhook_events_new RENAME TO webhook_events"
+                        )
             self.live_healthy = live_ledger.reconcile()["ok"]
         with demo_ledger.transaction():
             demo_ledger.db.execute("CREATE TABLE IF NOT EXISTS live_access (user_id TEXT PRIMARY KEY, terms_version TEXT NOT NULL, "
@@ -466,13 +515,19 @@ class PlatformService:
             raise NotFound("unknown webhook")
         event = adapter.verify_webhook(headers, raw, self.clock())
         with self.use_mode("live"):
-            with self.ledger.lock:
-                if self.ledger.db.execute("SELECT 1 FROM webhook_events WHERE event_id = ?", (event["id"],)).fetchone():
+            with self.ledger.transaction():
+                duplicate = self.ledger.db.execute(
+                    "SELECT 1 FROM webhook_events WHERE source = ? AND event_id = ?",
+                    (source, event["id"]),
+                ).fetchone()
+                if duplicate:
                     return {"status": "duplicate"}
-            outcome = self._apply_event(source, event)
-            with self.ledger.lock:
-                self.ledger.db.execute("INSERT OR IGNORE INTO webhook_events(event_id, source, received_at) VALUES (?, ?, ?)",
-                                       (event["id"], source, self.clock()))
+
+                outcome = self._apply_event(source, event)
+                self.ledger.db.execute(
+                    "INSERT INTO webhook_events(event_id, source, received_at) VALUES (?, ?, ?)",
+                    (event["id"], source, self.clock()),
+                )
         return {"status": outcome}
 
     def _apply_event(self, source: str, event: dict[str, Any]) -> str:

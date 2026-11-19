@@ -20,6 +20,66 @@ class LedgerCase(unittest.TestCase):
 
 
 class TestInvariants(LedgerCase):
+    def test_nested_transaction_rolls_back_inner_savepoint_only(self):
+        with self.ledger.transaction():
+            self.ledger.db.execute(
+                "CREATE TABLE nested_tx_test (value TEXT)"
+            )
+            self.ledger.db.execute(
+                "INSERT INTO nested_tx_test(value) VALUES (?)",
+                ("outer-before",),
+            )
+
+            with self.assertRaises(RuntimeError):
+                with self.ledger.transaction():
+                    self.ledger.db.execute(
+                        "INSERT INTO nested_tx_test(value) VALUES (?)",
+                        ("inner-rollback",),
+                    )
+                    raise RuntimeError("force nested rollback")
+
+            self.ledger.db.execute(
+                "INSERT INTO nested_tx_test(value) VALUES (?)",
+                ("outer-after",),
+            )
+
+        rows = self.ledger.db.execute(
+            "SELECT value FROM nested_tx_test ORDER BY value"
+        ).fetchall()
+
+        self.assertEqual(
+            [row["value"] for row in rows],
+            ["outer-after", "outer-before"],
+        )
+
+    def test_outer_rollback_also_rolls_back_released_inner_savepoint(self):
+        self.ledger.db.execute(
+            "CREATE TABLE nested_outer_rollback_test (value TEXT)"
+        )
+
+        with self.assertRaises(RuntimeError):
+            with self.ledger.transaction():
+                self.ledger.db.execute(
+                    "INSERT INTO nested_outer_rollback_test(value) VALUES (?)",
+                    ("outer-work",),
+                )
+
+                with self.ledger.transaction():
+                    self.ledger.db.execute(
+                        "INSERT INTO nested_outer_rollback_test(value) VALUES (?)",
+                        ("inner-work",),
+                    )
+
+                # The inner savepoint has been released, but the outer
+                # transaction must still be able to roll back both writes.
+                raise RuntimeError("force outer rollback")
+
+        rows = self.ledger.db.execute(
+            "SELECT value FROM nested_outer_rollback_test ORDER BY value"
+        ).fetchall()
+
+        self.assertEqual(rows, [])
+
     def test_unbalanced_operation_is_rejected(self):
         with self.assertRaises(LedgerError):
             with self.ledger.transaction():

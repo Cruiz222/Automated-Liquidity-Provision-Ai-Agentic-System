@@ -210,6 +210,229 @@ class TestLiveDeposits(LiveCase):
         with service.use_mode("live", uid):
             self.assertEqual(service.wallet(uid)["balances"]["NGN"], 500_000_000)
 
+    def test_same_event_id_from_different_sources_is_not_a_duplicate(self):
+        service = self.make()
+        uid = self.user()
+        self.fund_live_ngn(uid)
+
+        live_ledger = service.books["live"].ledger
+
+        # Seed USDT directly: this test concerns webhook identity, not conversion.
+        live_ledger.deposit(uid, "USDT", 100_000_000, "seed-cross-source-usdt")
+
+        ngn_withdrawal = live_ledger.request_withdrawal(
+            uid,
+            "NGN",
+            4_000_000,
+            {"bank_code": "058", "account_number": ACCOUNT},
+            "cross-source-ngn",
+        )
+        usdt_withdrawal = live_ledger.request_withdrawal(
+            uid,
+            "USDT",
+            6_000_000,
+            {"network": "TRC20", "address": "T" + "A" * 33},
+            "cross-source-usdt",
+        )
+
+        live_ledger.mark_withdrawal_processing(
+            ngn_withdrawal["withdrawal_id"], "provider-ngn-cross-source"
+        )
+        live_ledger.mark_withdrawal_processing(
+            usdt_withdrawal["withdrawal_id"], "provider-usdt-cross-source"
+        )
+
+        shared_id = "shared-event-id"
+
+        payments_event = {
+            "id": shared_id,
+            "type": "payout.completed",
+            "withdrawal_id": ngn_withdrawal["withdrawal_id"],
+        }
+        chain_event = {
+            "id": shared_id,
+            "type": "payout.completed",
+            "withdrawal_id": usdt_withdrawal["withdrawal_id"],
+        }
+
+        self.assertEqual(
+            self.post_event("payments", payments_event),
+            {"status": "applied"},
+        )
+        self.assertEqual(
+            self.post_event("chain", chain_event),
+            {"status": "applied"},
+        )
+
+        rows = live_ledger.db.execute(
+            "SELECT source, event_id FROM webhook_events WHERE event_id = ? ORDER BY source",
+            (shared_id,),
+        ).fetchall()
+
+        self.assertEqual(
+            [(row["source"], row["event_id"]) for row in rows],
+            [
+                ("chain", shared_id),
+                ("payments", shared_id),
+            ],
+        )
+
+        self.assertEqual(
+            live_ledger.get_withdrawal(ngn_withdrawal["withdrawal_id"])["status"],
+            "completed",
+        )
+        self.assertEqual(
+            live_ledger.get_withdrawal(usdt_withdrawal["withdrawal_id"])["status"],
+            "completed",
+        )
+
+    def test_concurrent_duplicate_webhooks_apply_only_once(self):
+        service = self.make()
+        uid = self.user()
+        request = service.live_deposit_request(uid, 500_000_000, "live-dep-concurrent", pin=PIN)
+        event = {
+            "id": "concurrent-event-id",
+            "type": "deposit.confirmed",
+            "reference": request["reference"],
+            "amount_minor": 500_000_000,
+            "currency": "NGN",
+        }
+        start = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def deliver():
+            try:
+                start.wait(timeout=5)
+                results.append(self.post_event("payments", event))
+            except Exception as error:
+                errors.append(error)
+
+        workers = [threading.Thread(target=deliver) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(result["status"] for result in results),
+            ["applied", "duplicate"],
+        )
+
+        with service.use_mode("live", uid):
+            self.assertEqual(service.wallet(uid)["balances"]["NGN"], 500_000_000)
+
+        count = service.books["live"].ledger.db.execute(
+            "SELECT COUNT(*) FROM webhook_events WHERE source = ? AND event_id = ?",
+            ("payments", "concurrent-event-id"),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_rejected_event_id_can_be_retried_after_payload_is_corrected(self):
+        service = self.make()
+        uid = self.user()
+        request = service.live_deposit_request(uid, 500_000_000, "live-dep-retry", pin=PIN)
+        event = {
+            "id": "retryable-event-id",
+            "type": "deposit.confirmed",
+            "reference": request["reference"],
+            "amount_minor": 900_000_000,
+            "currency": "NGN",
+        }
+
+        with self.assertRaises(WebhookRejected):
+            self.post_event("payments", event)
+
+        corrected = {**event, "amount_minor": 500_000_000}
+        self.assertEqual(self.post_event("payments", corrected), {"status": "applied"})
+
+        with service.use_mode("live", uid):
+            self.assertEqual(service.wallet(uid)["balances"]["NGN"], 500_000_000)
+
+    def test_webhook_schema_migration_preserves_existing_rows(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            live_db = str(Path(tmp) / "live.sqlite3")
+            with sqlite3.connect(live_db) as db:
+                db.execute("""
+                    CREATE TABLE webhook_events (
+                        event_id TEXT PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        received_at REAL NOT NULL
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO webhook_events(event_id, source, received_at) VALUES (?, ?, ?)",
+                    ("legacy-event-1", "payments", 1234.5),
+                )
+
+            main_db = str(Path(tmp) / "platform.sqlite3")
+            service = self.make(database=main_db, live_database=live_db)
+            db = service.books["live"].ledger.db
+
+            columns = db.execute("PRAGMA table_info(webhook_events)").fetchall()
+            primary_key = [
+                row["name"]
+                for row in sorted(columns, key=lambda row: row["pk"])
+                if row["pk"] > 0
+            ]
+            preserved = db.execute(
+                "SELECT event_id, source, received_at FROM webhook_events"
+            ).fetchall()
+
+            self.assertEqual(primary_key, ["source", "event_id"])
+            self.assertEqual(
+                [(row["event_id"], row["source"], row["received_at"]) for row in preserved],
+                [("legacy-event-1", "payments", 1234.5)],
+            )
+
+    def test_malformed_webhook_schema_is_preserved_when_migration_fails(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            live_db = str(Path(tmp) / "live.sqlite3")
+            main_db = str(Path(tmp) / "platform.sqlite3")
+
+            with sqlite3.connect(live_db) as db:
+                db.execute("""
+                    CREATE TABLE webhook_events (
+                        event_id TEXT PRIMARY KEY,
+                        source TEXT NOT NULL
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO webhook_events(event_id, source) VALUES (?, ?)",
+                    ("legacy-event-malformed", "payments"),
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cannot migrate webhook_events: missing required columns: received_at",
+            ):
+                self.make(database=main_db, live_database=live_db)
+
+            # The failed migration must not destroy or partially replace
+            # the original table or its existing records.
+            with sqlite3.connect(live_db) as db:
+                columns = db.execute(
+                    "PRAGMA table_info(webhook_events)"
+                ).fetchall()
+                rows = db.execute(
+                    "SELECT event_id, source FROM webhook_events"
+                ).fetchall()
+
+            self.assertEqual(
+                [row[1] for row in columns],
+                ["event_id", "source"],
+            )
+            self.assertEqual(
+                rows,
+                [("legacy-event-malformed", "payments")],
+            )
+
     def test_mismatched_unknown_and_unsigned_events_are_refused(self):
         service = self.make()
         uid = self.user()

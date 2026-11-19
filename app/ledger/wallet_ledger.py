@@ -231,6 +231,7 @@ class WalletLedger:
                 raise InvalidOperation(f"unsupported currency: {currency!r}")
             self.withdrawal_limits[currency] = limits
         self._lock = threading.RLock()
+        self._savepoint_counter = 0
         self.lock = self._lock          # shared by services that use this connection
         if self.database != ":memory:":
             _secure_database_file(self.database)
@@ -309,15 +310,37 @@ class WalletLedger:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """Run a block inside one ``BEGIN IMMEDIATE`` transaction (commit or roll back)."""
+        """Run an immediate transaction, using savepoints when nested."""
         with self._lock:
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
-                yield
-                self.db.execute("COMMIT")
-            except BaseException:
-                self.db.execute("ROLLBACK")
-                raise
+            if self.db.in_transaction:
+                self._savepoint_counter += 1
+                savepoint = f"wallet_tx_{self._savepoint_counter}"
+                self.db.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    yield
+                    self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except BaseException:
+                    try:
+                        self.db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except sqlite3.Error:
+                        # If savepoint recovery fails, do not leave the outer
+                        # transaction open with an uncertain connection state.
+                        if self.db.in_transaction:
+                            try:
+                                self.db.execute("ROLLBACK")
+                            except sqlite3.Error:
+                                pass
+                    raise
+            else:
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    yield
+                    self.db.execute("COMMIT")
+                except BaseException:
+                    if self.db.in_transaction:
+                        self.db.execute("ROLLBACK")
+                    raise
 
     _tx = transaction
 
