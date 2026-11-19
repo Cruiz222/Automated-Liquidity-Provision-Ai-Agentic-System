@@ -546,7 +546,7 @@ class AccountStore:
                 "WHERE user_id = ? AND purpose = ? AND used = 0",
                 (user_id, purpose),
             )
-            self.db.execute(
+            cursor = self.db.execute(
                 "INSERT INTO email_codes(user_id, purpose, email_key, code_hash, expires_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (
@@ -557,18 +557,47 @@ class AccountStore:
                     self.clock() + CODE_TTL,
                 ),
             )
+            code_id = cursor.lastrowid
 
         subject = {
             "verify": "Your verification code",
             "reset": "Your password reset code",
             "pin": "Your PIN reset code",
         }[purpose]
-        self.mailer.send(
-            destination,
-            subject,
-            f"Your code is {code}. It expires in {CODE_TTL // 60} minutes. "
-            "If you did not ask for it, ignore this message and do not share the code.",
-        )
+        try:
+            self.mailer.send(
+                destination,
+                subject,
+                f"Your code is {code}. It expires in {CODE_TTL // 60} minutes. "
+                "If you did not ask for it, ignore this message and do not share the code.",
+            )
+        except Exception as delivery_error:
+            # A failed or ambiguous delivery must not leave an unseen code usable.
+            # Retire only this code: a concurrent resend may have created a newer one.
+            try:
+                with self.ledger.transaction():
+                    self.db.execute(
+                        "UPDATE email_codes SET used = 1 WHERE code_id = ? AND used = 0",
+                        (code_id,),
+                    )
+            except Exception as cleanup_error:
+                # Preserve the original delivery exception.
+                if hasattr(delivery_error, "add_note"):
+                    delivery_error.add_note(
+                        f"Email-code cleanup also failed: {type(cleanup_error).__name__}"
+                    )
+
+            try:
+                self.audit(user_id, "email_code_delivery_failed", ip, purpose=purpose)
+            except Exception as audit_error:
+                # Auditing must not replace the original delivery exception either.
+                if hasattr(delivery_error, "add_note"):
+                    delivery_error.add_note(
+                        f"Email-code failure audit also failed: {type(audit_error).__name__}"
+                    )
+
+            raise
+
         self.audit(user_id, "email_code_sent", ip, purpose=purpose)
 
     def set_email(self, user_id: str, email: Any, password: Any, otp: Any = None, ip: str = "") -> None:

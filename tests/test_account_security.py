@@ -221,6 +221,116 @@ class TestEmail(Case):
         self.assertNotEqual(digest, other._hash_code("01234567", "u_test", "verify"))
         self.assertEqual(len(digest), 64)
 
+    def test_failed_email_delivery_retires_code_and_allows_resend(self):
+        user = self.accounts.register(
+            "alice", PW, email="original@example.com"
+        )["user_id"]
+        self.accounts.verify_email(user, self.last_code())
+
+        failed_mailer = mock.Mock()
+        failed_mailer.send.side_effect = OSError("SMTP unavailable")
+        self.accounts.mailer = failed_mailer
+
+        with self.assertRaisesRegex(OSError, "SMTP unavailable"):
+            self.accounts.set_email(user, "new@example.com", PW)
+
+        status = self.accounts.security_status(user)
+        self.assertEqual(status["email"], "original@example.com")
+        self.assertTrue(status["email_verified"])
+        self.assertEqual(status["pending_email"], "new@example.com")
+
+        active_codes = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM email_codes "
+            "WHERE user_id = ? AND purpose = 'verify' AND used = 0",
+            (user,),
+        ).fetchone()[0]
+
+        self.assertEqual(active_codes, 0)
+
+        # A fresh delivery can complete the pending email change.
+        self.accounts.mailer = self.mailer
+        self.accounts.send_email_code(user, "verify")
+        self.accounts.verify_email(user, self.last_code())
+
+        status = self.accounts.security_status(user)
+        self.assertEqual(status["email"], "new@example.com")
+        self.assertTrue(status["email_verified"])
+        self.assertIsNone(status["pending_email"])
+
+    def test_cleanup_failure_does_not_mask_email_delivery_error(self):
+        user = self.accounts.register(
+            "alice", PW, email="alice@example.com"
+        )["user_id"]
+
+        failed_mailer = mock.Mock()
+        failed_mailer.send.side_effect = OSError("SMTP unavailable")
+        self.accounts.mailer = failed_mailer
+
+        original_transaction = self.ledger.transaction
+        transaction_calls = 0
+
+        def fail_cleanup_transaction(*args, **kwargs):
+            nonlocal transaction_calls
+            transaction_calls += 1
+
+            # Allow the initial code insertion, but fail the cleanup transaction.
+            if transaction_calls == 2:
+                raise RuntimeError("database cleanup unavailable")
+
+            return original_transaction(*args, **kwargs)
+
+        with mock.patch.object(
+            self.ledger,
+            "transaction",
+            side_effect=fail_cleanup_transaction,
+        ):
+            with self.assertRaisesRegex(OSError, "SMTP unavailable") as caught:
+                self.accounts.send_email_code(user, "verify")
+
+        notes = getattr(caught.exception, "__notes__", [])
+        self.assertTrue(
+            any("Email-code cleanup also failed" in note for note in notes)
+        )
+
+        # Cleanup failed, so the code remains active until separately invalidated
+        # or expired. The original SMTP exception must still reach the caller.
+        active_codes = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM email_codes "
+            "WHERE user_id = ? AND purpose = 'verify' AND used = 0",
+            (user,),
+        ).fetchone()[0]
+        self.assertEqual(active_codes, 1)
+
+    def test_audit_failure_does_not_mask_email_delivery_error(self):
+        user = self.accounts.register(
+            "alice", PW, email="alice@example.com"
+        )["user_id"]
+
+        failed_mailer = mock.Mock()
+        failed_mailer.send.side_effect = OSError("SMTP unavailable")
+        self.accounts.mailer = failed_mailer
+
+        with mock.patch.object(
+            self.accounts,
+            "audit",
+            side_effect=RuntimeError("audit unavailable"),
+        ):
+            with self.assertRaisesRegex(OSError, "SMTP unavailable") as caught:
+                self.accounts.send_email_code(user, "verify")
+
+        notes = getattr(caught.exception, "__notes__", [])
+        self.assertTrue(
+            any("Email-code failure audit also failed" in note for note in notes)
+        )
+
+        # Cleanup succeeded even though audit recording failed.
+        active_codes = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM email_codes "
+            "WHERE user_id = ? AND purpose = 'verify' AND used = 0",
+            (user,),
+        ).fetchone()[0]
+        self.assertEqual(active_codes, 0)
+
     def test_registration_with_email_sends_a_code_and_verifies(self):
         user = self.accounts.register("alice", PW, email="Alice@Example.com")["user_id"]
         self.assertEqual(self.mailer.sent[-1][0], "Alice@Example.com")

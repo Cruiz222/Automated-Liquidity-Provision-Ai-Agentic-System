@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from app.accounts import totp
 from app.accounts.auth import AccountStore, AuthError, ConflictError, OtpRequired, RateLimited
@@ -117,6 +119,31 @@ class AccountStoreTotpTests(unittest.TestCase):
                 "SELECT totp_last_step FROM users WHERE user_id = ?",
                 (self.user,),
             ).fetchone()
+        self.assertEqual(row["totp_last_step"], step)
+
+    def test_concurrent_totp_consumption_accepts_the_same_step_only_once(self):
+        secret = self._enable()
+        step = totp.current_step(self.now)
+        code = _code(secret, step)
+        start = Barrier(2)
+
+        def consume_same_code():
+            start.wait(timeout=5)
+            return self.store._consume_totp(self.user, code)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(lambda _index: consume_same_code(), range(2))
+            )
+
+        self.assertCountEqual(results, [True, False])
+
+        with self.ledger.lock:
+            row = self.ledger.db.execute(
+                "SELECT totp_last_step FROM users WHERE user_id = ?",
+                (self.user,),
+            ).fetchone()
+
         self.assertEqual(row["totp_last_step"], step)
 
     def test_login_requires_otp_and_consumes_step(self):
